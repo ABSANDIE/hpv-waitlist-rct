@@ -1,0 +1,8 @@
+data/raw/
+*.csv
+*.xlsx
+*.dta
+.Renviron
+.Rhistory
+.RData
+.DS_Store

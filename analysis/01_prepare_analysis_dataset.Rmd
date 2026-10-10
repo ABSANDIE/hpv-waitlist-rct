@@ -1,0 +1,429 @@
+---
+title: "HPV community follow-up trial: preparation of the analysis dataset"
+subtitle: "Implements SAP v2.5 (Derivation from CHT Fields; Key Variables; Analysis Populations)"
+date: "`r format(Sys.time(), '%d %B %Y %H:%M')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  # Defaults point to the SYNTHETIC tables made by R/00_simulate_test_data.R.
+  # Paths are relative to this file (analysis/). For the real CHT extracts, pass
+  # the paths through run_all.R (see config_real_template.R); never commit them.
+  data_dir: "../data/synthetic"
+  mali_patients: "mali_patients.csv"
+  mali_baseline: "mali_baseline.csv"
+  mali_followup: "mali_followup.csv"
+  mali_verification: "mali_verification.csv"
+  civ_patients: "civ_patients.csv"
+  civ_baseline: "civ_baseline.csv"
+  civ_followup: "civ_followup.csv"
+  civ_verification: "civ_verification.csv"
+  # Codes of s_can_we_have_vaccination_infos meaning "information not available"
+  followup_no_info_values: "no,non,info_not_available"
+  out_dir: "../outputs"
+  functions: "../R/hpv_functions.R"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "")
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(stringr); library(purrr)
+  library(lubridate); library(knitr)
+})
+source(params$functions)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+launch <- study_dates$launch
+kbl <- function(x, ...) knitr::kable(x, format.args = list(big.mark = ","), ...)
+```
+
+> **Blinding note.** This document reports data-quality and completeness
+> checks only. It never tabulates vaccination outcomes by arm. Outcome
+> comparisons are made only in `02_prespecified_analysis.Rmd`, after the
+> eligibility review has been frozen and the dataset locked (SAP v2.5).
+
+# Load the CHT extracts
+
+```{r load}
+path <- function(f) file.path(params$data_dir, f)
+files <- list(
+  Mali = list(patients = params$mali_patients, baseline = params$mali_baseline,
+              followup = params$mali_followup, verification = params$mali_verification),
+  CIV  = list(patients = params$civ_patients, baseline = params$civ_baseline,
+              followup = params$civ_followup, verification = params$civ_verification))
+raw <- map(files, ~ map(.x, ~ read_table(path(.x))))
+
+tibble(country = rep(names(files), each = 4),
+       table   = rep(names(files$Mali), 2),
+       file    = unlist(map(files, unlist)),
+       found   = unlist(map(raw, ~ map_lgl(.x, Negate(is.null)))),
+       rows    = unlist(map(raw, ~ map_int(.x, ~ if (is.null(.x)) NA_integer_ else nrow(.x)))),
+       columns = unlist(map(raw, ~ map_int(.x, ~ if (is.null(.x)) NA_integer_ else ncol(.x))))) %>% kbl()
+
+countries <- names(raw)[map_lgl(raw, ~ !is.null(.x$patients))]
+if (!length(countries)) stop("No patients table found: check params$data_dir and the file names.")
+missing_tbl <- setdiff(names(raw), countries)
+if (length(missing_tbl)) warning("No patients table for: ", paste(missing_tbl, collapse = ", "),
+                                 " - this country is skipped.")
+```
+
+# Master list of girls (patients table)
+
+Arm comes from `vaccination_trial_branch`; date of birth from `date_of_birth`,
+completed by `etl_dob_combine`; site and CHW supervision zone from `site_uuid`
+and `supervisor_area_uuid` (SAP v2.5). Names and phone numbers are never read
+into the analysis dataset.
+
+```{r patients}
+girls0 <- map_dfr(countries, function(cn) {
+  p <- raw[[cn]]$patients
+  dob_raw <- to_date(col_or_na(p, "date_of_birth"))
+  tibble(
+    country      = cn,
+    girl_id      = p$uuid,
+    arm          = norm_arm(col_or_na(p, "vaccination_trial_branch")),
+    in_trial     = to_bool(col_or_na(p, "in_vaccination_trial")),
+    sex          = norm_sex(coalesce(col_or_na(p, "etl_sex"), col_or_na(p, "sexe"))),
+    dob          = coalesce(dob_raw, to_date(col_or_na(p, "etl_dob_combine"))),
+    dob_source   = case_when(!is.na(dob_raw) ~ "date_of_birth",
+                             !is.na(to_date(col_or_na(p, "etl_dob_combine"))) ~ "etl_dob_combine",
+                             TRUE ~ NA_character_),
+    dob_approx   = !is.na(to_date(col_or_na(p, "etl_dob_approx"))) | is.na(dob_raw),
+    site         = coalesce(col_or_na(p, "site_name"), col_or_na(p, "site_uuid")),
+    chw_zone     = col_or_na(p, "supervisor_area_uuid"),
+    muted_date   = to_date(col_or_na(p, "muted")),
+    death_date   = to_date(col_or_na(p, "date_of_death")),
+    family_muted_date = to_date(col_or_na(p, "c50_family_muted")))
+})
+
+# Duplicate master records
+dups <- girls0 %>% count(country, girl_id) %>% filter(n > 1)
+girls0 <- girls0 %>% distinct(country, girl_id, .keep_all = TRUE)
+
+# Trial membership: an arm is recorded
+girls0 %>% mutate(arm_recorded = !is.na(arm)) %>%
+  count(country, in_vaccination_trial = in_trial, arm_recorded) %>% kbl(caption = "Trial flags in the master table")
+girls <- girls0 %>% filter(!is.na(arm))
+cat("Duplicate patient uuids removed:", nrow(dups), "\n")
+```
+
+# Assessment records from the three forms
+
+One row per form submission, with HPV status (`yes`/`no`/unknown), the
+documented vaccination date, and the reasons why status could not be obtained.
+
+```{r records}
+no_info <- trimws(strsplit(params$followup_no_info_values, ",")[[1]])
+rec_raw <- map_dfr(countries, function(cn) bind_rows(
+  records_baseline(raw[[cn]]$baseline, cn),
+  records_followup(raw[[cn]]$followup, cn, no_info_values = no_info),
+  records_verification(raw[[cn]]$verification, cn)))
+
+# Same submission exported twice -> keep once
+rec_raw <- rec_raw %>% distinct(country, record_uuid, .keep_all = TRUE)
+
+# Forms for girls not in the trial master list
+orphans <- rec_raw %>% anti_join(girls, by = c("country", "girl_id")) %>% count(country, form)
+rec <- clean_records(rec_raw %>% semi_join(girls, by = c("country", "girl_id")), launch)
+
+qc_rec <- rec_raw %>% semi_join(girls, by = c("country", "girl_id")) %>%
+  mutate(launch = launch[country],
+         assess_missing = is.na(assess_date),
+         assess_outside = !is.na(assess_date) & (assess_date < launch - 30 | assess_date > study_dates$window_end),
+         assess_before_launch = !is.na(assess_date) & assess_date < launch & assess_date >= launch - 30,
+         vacc_after_visit = !is.na(vacc_date) & !is.na(assess_date) & vacc_date > assess_date,
+         dose_undated = hpv %in% "yes" & is.na(vacc_date),
+         status_missing = is.na(hpv)) %>%
+  group_by(country, form) %>%
+  summarise(records = n(), girls = n_distinct(girl_id),
+            `no assessment date (dropped)` = sum(assess_missing),
+            `assessment date out of window (dropped)` = sum(assess_outside),
+            `visit up to 30 days before launch (kept)` = sum(assess_before_launch),
+            `dose dated after the visit (date set to missing)` = sum(vacc_after_visit),
+            `dose reported without a date` = sum(dose_undated),
+            `HPV status not obtained` = sum(status_missing), .groups = "drop")
+kbl(qc_rec, caption = "Record-level data quality (all arms pooled)")
+if (nrow(orphans)) kbl(orphans, caption = "Form records for girls absent from the master list (excluded)")
+
+# Duplicate baseline forms per girl
+rec %>% filter(form == "baseline") %>% count(country, girl_id) %>% filter(n > 1) %>%
+  count(country, name = "girls with >1 baseline form") %>% kbl()
+```
+
+## Fill zone and date of birth from the forms when absent from the master list
+
+```{r fill}
+form_zone <- rec %>% filter(!is.na(chw_zone_form)) %>% count(country, girl_id, chw_zone_form) %>%
+  group_by(country, girl_id) %>% slice_max(n, n = 1, with_ties = FALSE) %>%
+  select(country, girl_id, zone_from_form = chw_zone_form)
+form_dob <- rec %>% filter(!is.na(age_days_form), age_days_form > 0) %>%
+  mutate(dob_f = assess_date - age_days_form) %>% group_by(country, girl_id) %>%
+  summarise(dob_from_form = as.Date(median(as.numeric(dob_f)), origin = "1970-01-01"), .groups = "drop")
+
+girls <- girls %>% left_join(form_zone, by = c("country", "girl_id")) %>%
+  left_join(form_dob, by = c("country", "girl_id")) %>%
+  mutate(zone_source = if_else(is.na(chw_zone) & !is.na(zone_from_form), "form", "patients"),
+         chw_zone = coalesce(chw_zone, zone_from_form),
+         dob_source = if_else(is.na(dob) & !is.na(dob_from_form), "form age_in_days", dob_source),
+         dob_approx = dob_approx | (is.na(dob) & !is.na(dob_from_form)),
+         dob = coalesce(dob, dob_from_form)) %>%
+  select(-zone_from_form, -dob_from_form)
+girls %>% count(country, dob_source, zone_source) %>% kbl(caption = "Source of date of birth and CHW zone")
+```
+
+# Allocation by the age-out rule and age covariates
+
+The age-out allocation is not recorded in CHT. It is recovered from the current
+date of birth: intervention-arm girls who reached the national upper age limit
+after launch and on or before 1 July 2026 (SAP v2.5).
+
+```{r ageout}
+girls <- girls %>%
+  mutate(launch          = launch[country],
+         lower           = map_dbl(country, ~ eligibility[[.x]][["lower"]]),
+         upper           = map_dbl(country, ~ eligibility[[.x]][["upper"]]),
+         ageout_date     = add_years(dob, upper),
+         eligible_from   = add_years(dob, lower),
+         age_launch_days = as.numeric(launch - dob),
+         age_years       = floor(time_length(interval(dob, launch), "years")),
+         months_remaining = as.numeric(ageout_date - launch) / 30.4375,
+         ageout_rule     = !is.na(ageout_date) & ageout_date > launch & ageout_date <= study_dates$phase1_end,
+         ageout          = ageout_rule & arm == "Intervention",
+         ageout_rule_control = ageout_rule & arm == "Control",
+         allocation      = if_else(ageout, "Age-out rule", "Randomized"))
+
+girls %>% group_by(country) %>%
+  summarise(intervention = sum(arm == "Intervention"), control = sum(arm == "Control"),
+            `age-out recovered (intervention)` = sum(ageout),
+            `meets age-out rule in control arm` = sum(ageout_rule_control),
+            `missing DOB` = sum(is.na(dob)), .groups = "drop") %>%
+  mutate(`age-out expected` = expected_ageout[country],
+         `difference` = `age-out recovered (intervention)` - `age-out expected`) %>%
+  kbl(caption = "Recovered age-out allocation vs known totals (Mali 1,945; CIV 165)")
+```
+
+Any difference from the known totals, and any control-arm girl meeting the rule,
+is investigated as a likely date-of-birth correction made after randomization.
+
+# Post-randomization eligibility review (cause 3b)
+
+Rule (SAP v2.5): not eligible if the current sex is male, or if the current date
+of birth places the girl outside the national eligibility range for the whole
+study period (already past the upper limit at launch, or not reaching the lower
+limit by 1 October 2026). The review list below contains **no arm and no
+outcome**, so it can be checked by a blinded data manager and frozen before the
+analysis.
+
+```{r eligibility}
+girls <- girls %>%
+  mutate(inelig_sex = sex %in% "male",
+         inelig_age = !is.na(dob) & (ageout_date <= launch | eligible_from > study_dates$window_end),
+         eligible_final = as.integer(!(inelig_sex | inelig_age)),
+         review_reason = case_when(inelig_sex & inelig_age ~ "sex and age",
+                                   inelig_sex ~ "sex", inelig_age ~ "age"),
+         review_flag_missing = is.na(dob) | is.na(sex))
+review_list <- girls %>% filter(eligible_final == 0 | review_flag_missing) %>%
+  transmute(country, girl_id, dob, sex, review_reason,
+            note = if_else(review_flag_missing, "DOB or sex missing: retained, check", NA_character_))
+write_csv(review_list, file.path(params$out_dir, sprintf("eligibility_review_list_%s.csv", Sys.Date())))
+girls %>% count(country, review_reason) %>% kbl(caption = "Eligibility review (NA = eligible)")
+```
+
+# Vaccination status
+
+* **Phase 1 (status on 1 July 2026)**: vaccinated if any form records a dose
+  dated on or before 1 July (or a dose without a usable date reported at a visit
+  on or before 1 July); known unvaccinated if an assessment dated 2 July – 1
+  October records no dose or a dose dated after 1 July.
+* **Verification-timing sensitivity**: the same, using only assessments up to 30
+  August 2026.
+* **Phase 2 (status on 1 October 2026)**: vaccinated if a dose is dated on or
+  before 1 October; unvaccinated if the last visit on or before 1 October
+  recorded no dose.
+* **prior_vacc**: 1 if a dose is dated before launch; 0 if a form records the
+  girl unvaccinated at or after launch (or at the baseline visit) or a first
+  dose dated on or after launch; otherwise unknown.
+
+```{r status}
+p1  <- status_at(rec, study_dates$phase1_end, known_from = study_dates$crossover)
+p1a <- status_at(rec, study_dates$phase1_end, known_from = study_dates$crossover,
+                 window_end = study_dates$verif_close_1)
+p2  <- status_at(rec, study_dates$window_end, known_from = launch)
+# Sensitivity: phase 2 status established only by a visit on/after 2 July
+p2r <- status_at(rec, study_dates$window_end, known_from = study_dates$crossover)
+# Verification visit for phase 1: first assessment with a recorded status in 2 July - 1 October
+win_visit <- rec %>% filter(!is.na(hpv), assess_date >= study_dates$crossover,
+                            assess_date <= study_dates$window_end) %>%
+  group_by(country, girl_id) %>% summarise(first_window_visit = min(assess_date), .groups = "drop")
+
+prior <- rec %>% mutate(launch = launch[country]) %>% group_by(country, girl_id) %>%
+  summarise(dose_before = any(hpv %in% "yes" & !is.na(vacc_date) & vacc_date < launch),
+            unvacc_at_launch = any(hpv %in% "no" & (assess_date >= launch | form == "baseline")) |
+                               any(hpv %in% "yes" & !is.na(vacc_date) & vacc_date >= launch),
+            .groups = "drop") %>%
+  mutate(prior_vacc = case_when(dose_before ~ 1L, unvacc_at_launch ~ 0L, TRUE ~ NA_integer_))
+
+# Reasons why status could not be obtained (any form)
+reasons <- rec %>% group_by(country, girl_id) %>%
+  summarise(any_no_card = any(no_card & is.na(hpv)),
+            any_info_unavailable = any(info_unavailable),
+            any_refused = any(info_refused), any_moved = any(moved),
+            first_visit = min(assess_date), .groups = "drop")
+visits_in <- function(from, to) rec %>% filter(assess_date >= from, assess_date <= to) %>%
+  distinct(country, girl_id) %>% mutate(v = TRUE)
+
+pick <- function(s, sfx) s %>% select(country, girl_id, vacc, status_date, last_unvacc, first_dose,
+                                      undated_by, undated_after, conflict, n_contacts, last_visit) %>%
+  rename_with(~ paste0(.x, sfx), -c(country, girl_id))
+girls <- girls %>%
+  left_join(pick(p1, "_p1"), by = c("country", "girl_id")) %>%
+  left_join(p1a %>% select(country, girl_id, vacc_p1_aug = vacc), by = c("country", "girl_id")) %>%
+  left_join(pick(p2, "_p2"), by = c("country", "girl_id")) %>%
+  left_join(p2r %>% select(country, girl_id, vacc_p2_recent = vacc), by = c("country", "girl_id")) %>%
+  left_join(win_visit, by = c("country", "girl_id")) %>%
+  left_join(prior %>% select(country, girl_id, prior_vacc), by = c("country", "girl_id")) %>%
+  left_join(reasons, by = c("country", "girl_id")) %>%
+  left_join(visits_in(study_dates$crossover, study_dates$window_end) %>% rename(visited_window_p1 = v),
+            by = c("country", "girl_id")) %>%
+  mutate(across(c(any_no_card, any_info_unavailable, any_refused, any_moved, visited_window_p1,
+                  undated_after_p1, undated_after_p2, conflict_p1, conflict_p2), ~ coalesce(.x, FALSE)),
+         n_contacts = coalesce(n_contacts_p2, 0L),
+         visited_any = !is.na(last_visit_p2))
+```
+
+## Conflicting records
+
+Records are resolved in favour of a documented dose date (SAP v2.5). Pooled
+counts, all arms together:
+
+```{r conflicts}
+girls %>% group_by(country) %>%
+  summarise(`dose dated <= 1 Jul and a later 'no' record` = sum(conflict_p1),
+            `dose dated <= 1 Oct and a later 'no' record` = sum(conflict_p2),
+            `vaccinated only via an undated report` = sum(is.na(first_dose_p1) & !is.na(undated_by_p1)),
+            .groups = "drop") %>% kbl()
+```
+
+# Cause of unknown status
+
+Hierarchy 3b → 1 → 4 → 3a → 2 → 3c (SAP v2.5). Assigned without reference to
+vaccination outcomes.
+
+```{r causes}
+assign_cause <- function(g, vacc, window_start, window_end, visited_window) {
+  deact <- (!is.na(g$muted_date) & g$muted_date <= window_end) |
+           (!is.na(g$death_date) & g$death_date <= window_end) |
+           (!is.na(g$family_muted_date) & g$family_muted_date <= window_end) | g$any_moved
+  aged  <- !is.na(g$ageout_date) & g$ageout_date <= window_end & !visited_window
+  noinf <- g$any_no_card | g$any_info_unavailable | g$undated_after
+  case_when(!is.na(vacc)          ~ NA_character_,
+            g$eligible_final == 0 ~ "3b",
+            deact                 ~ "1",
+            g$any_refused         ~ "4",
+            aged                  ~ "3a",
+            noinf                 ~ "2",
+            TRUE                  ~ "3c")
+}
+girls$undated_after <- girls$undated_after_p1
+girls$unknown_reason_p1 <- assign_cause(girls, girls$vacc_p1, study_dates$crossover,
+                                        study_dates$window_end, girls$visited_window_p1)
+girls$undated_after <- girls$undated_after_p2
+girls$unknown_reason_p2 <- assign_cause(girls, girls$vacc_p2, girls$launch,
+                                        study_dates$window_end, girls$visited_any)
+girls <- girls %>% select(-undated_after) %>%
+  mutate(death = !is.na(death_date) & death_date <= study_dates$window_end)
+
+cause_labels <- c("1" = "1 Deactivated, deceased or moved", "2" = "2 No information source",
+                  "3a" = "3a Aged out", "3b" = "3b Age/sex data correction",
+                  "3c" = "3c Not reached in time", "4" = "4 Parents refused")
+girls %>% filter(eligible_final == 1) %>%
+  mutate(status_known_p1 = !is.na(vacc_p1)) %>%
+  group_by(country, arm) %>%
+  summarise(n = n(), `status known 1 Jul` = sum(status_known_p1),
+            `% unknown` = round(100 * mean(!status_known_p1), 1), .groups = "drop") %>%
+  kbl(caption = "Completeness of phase 1 status by arm (attrition targets: <10% control, <20% intervention)")
+girls %>% filter(!is.na(unknown_reason_p1)) %>% count(country, arm, unknown_reason_p1) %>%
+  pivot_wider(names_from = unknown_reason_p1, values_from = n, values_fill = 0) %>%
+  kbl(caption = "Cause of unknown phase 1 status by arm (Table 6, phase 1)")
+```
+
+# Time-to-event variables
+
+Days since the country launch. Only girls unvaccinated at launch
+(`prior_vacc = 0`) enter the time-to-event analyses. A dose reported without a
+usable date is placed at the visit that reported it (an upper bound).
+
+```{r tte}
+girls <- girls %>%
+  mutate(tau_p1 = as.numeric(study_dates$phase1_end - launch),
+         tau_p2 = as.numeric(study_dates$window_end - launch),
+         event_date_p1 = pmin(first_dose_p1, undated_by_p1, na.rm = TRUE),
+         event_date_p2 = pmin(first_dose_p2, undated_by_p2, na.rm = TRUE),
+         # Phase 1 (12 weeks): known unvaccinated -> censored at 1 July; unknown -> at last_status_date
+         last_status_date = last_unvacc_p1,
+         time_p1  = case_when(vacc_p1 == 1 ~ as.numeric(event_date_p1 - launch),
+                              vacc_p1 == 0 ~ tau_p1,
+                              TRUE ~ pmin(tau_p1, pmax(0, as.numeric(last_unvacc_p1 - launch)))),
+         event_p1 = as.integer(vacc_p1 %in% 1L),
+         # Phase 2 (to 1 October): unvaccinated -> censored at the last visit on/before 1 October
+         cens_date_p2 = if_else(!is.na(first_dose_p2) & first_dose_p2 > study_dates$window_end,
+                                study_dates$window_end, last_unvacc_p2),
+         time_p2  = case_when(vacc_p2 == 1 ~ as.numeric(event_date_p2 - launch),
+                              TRUE ~ pmin(tau_p2, pmax(0, as.numeric(cens_date_p2 - launch)))),
+         event_p2 = as.integer(vacc_p2 %in% 1L),
+         across(c(time_p1, time_p2), ~ if_else(is.na(.x), 0, .x)),
+         # a dose on launch day: half a day so that it counts as an event in survival software
+         time_p1 = if_else(event_p1 == 1 & time_p1 <= 0, 0.5, time_p1),
+         time_p2 = if_else(event_p2 == 1 & time_p2 <= 0, 0.5, time_p2),
+         days_to_vacc = if_else(vacc_p1 == 1 & prior_vacc %in% 0L, time_p1, NA_real_),
+         log_days_to_vacc = log(days_to_vacc + 1),
+         # SAP: date of the visit in the 2 July - 1 October window at which status was verified.
+         # Girls known only from a dose documented before 1 July without a later visit have none.
+         assess_date_phase1 = if_else(!is.na(vacc_p1), first_window_visit, as.Date(NA)),
+         verification_lag = as.numeric(assess_date_phase1 - study_dates$phase1_end),
+         verified_by_30aug = !is.na(vacc_p1_aug))
+girls %>% filter(eligible_final == 1) %>%
+  group_by(country) %>%
+  summarise(`unvaccinated at launch (enter TTE)` = sum(prior_vacc %in% 0L),
+            `vaccinated before launch` = sum(prior_vacc %in% 1L),
+            `prior_vacc unknown (excluded from TTE)` = sum(is.na(prior_vacc)), .groups = "drop") %>% kbl()
+```
+
+# Final analysis dataset
+
+```{r final}
+analysis <- girls %>%
+  transmute(
+    country = factor(country, levels = c("Mali", "CIV")), girl_id,
+    arm = factor(arm, levels = c("Control", "Intervention")), arm01 = as.integer(arm == "Intervention"),
+    allocation, ageout, ageout_rule_control, site, chw_zone, zone_source,
+    sex, dob, dob_source, dob_approx, age_years, months_remaining, ageout_date,
+    eligible_final, review_reason, pop_itt = eligible_final == 1,
+    pop_randomized = eligible_final == 1 & !ageout,
+    prior_vacc,
+    HPV_vaccinated = vacc_p1, status_known_phase1 = as.integer(!is.na(vacc_p1)),
+    HPV_vaccinated_aug30 = vacc_p1_aug, verified_by_30aug,
+    HPV_vaccinated_phase2 = vacc_p2, status_known_phase2 = as.integer(!is.na(vacc_p2)),
+    HPV_vaccinated_phase2_recent = vacc_p2_recent,
+    unknown_reason = unknown_reason_p1, unknown_reason_phase2 = unknown_reason_p2,
+    assess_date_phase1, verification_lag, last_status_date,
+    first_dose = first_dose_p2, dose_undated = is.na(first_dose_p2) & !is.na(undated_by_p2),
+    days_to_vacc, log_days_to_vacc,
+    tau_p1, time_p1, event_p1, tau_p2, time_p2, event_p2,
+    n_contacts, last_visit = last_visit_p2, death, death_date, muted_date, family_muted_date,
+    any_no_card, any_info_unavailable, any_refused, any_moved)
+
+saveRDS(analysis, file.path(params$out_dir, "analysis_dataset.rds"))
+write_csv(analysis, file.path(params$out_dir, "analysis_dataset.csv"), na = "")
+saveRDS(rec, file.path(params$out_dir, "assessment_records.rds"))   # for audit
+analysis %>% count(country, arm, allocation, pop_itt) %>% kbl(caption = "Girls in the analysis dataset")
+```
+
+The dataset `analysis_dataset.rds` (one row per girl) is the only input of
+`02_prespecified_analysis.Rmd`. It contains the pseudonymous CHT uuid but no
+names or phone numbers.
+
+```{r session, echo = FALSE}
+sessionInfo()
+```

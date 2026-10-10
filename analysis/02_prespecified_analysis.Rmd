@@ -1,0 +1,735 @@
+---
+title: "HPV community follow-up trial: pre-specified analysis"
+subtitle: "Statistical Analysis Plan v2.1 (7 October 2026)"
+date: "`r format(Sys.time(), '%d %B %Y %H:%M')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  data: "../outputs/analysis_dataset.rds"
+  out_dir: "../outputs"
+  functions: "../R/hpv_functions.R"
+  analysis_functions: "../R/hpv_analysis_functions.R"
+  run_mi: true          # multiple imputation (SAP: required if unknown status >10% in either arm)
+  mi_m: 50              # number of imputations (SAP: 50)
+  delta_grid: "0,-0.5,-1,-1.5,-2,-3"   # tipping-point offsets on the log-odds scale (cause 2)
+  boot_B: 500           # bootstrap replicates for the KM coverage difference (0 = skip)
+  seed: 20261001
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, comment = "",
+                      fig.width = 9, fig.height = 5.5, dpi = 120)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(readr); library(knitr)
+  library(ggplot2); library(lme4); library(survival); library(geepack); library(mice)
+})
+source(params$functions); source(params$analysis_functions)
+set.seed(params$seed)
+dir.create(params$out_dir, showWarnings = FALSE, recursive = TRUE)
+kbl <- function(x, digits = 3, ...) knitr::kable(x, digits = digits, format.args = list(big.mark = ","), ...)
+save_tbl <- function(x, name) { write_csv(x, file.path(params$out_dir, paste0(name, ".csv")), na = ""); invisible(x) }
+pal <- c(Control = "#6b6a66", Intervention = "#2a78d6")
+theme_set(theme_minimal(base_size = 11) + theme(panel.grid.minor = element_blank(), legend.position = "top"))
+```
+
+# Data, populations and model covariates
+
+```{r data}
+an <- readRDS(params$data) %>%
+  mutate(country = factor(country, levels = c("Mali", "CIV")),
+         arm = factor(arm, levels = c("Control", "Intervention")),
+         chw_zone = factor(chw_zone), site = factor(site))
+
+# Age: months remaining in the national eligibility window at launch, restricted
+# cubic spline with 3 knots (10th, 50th, 90th percentiles of the ITT population).
+knots <- rcs_knots(an$months_remaining[an$pop_itt])
+an <- add_age_spline(an, knots)
+cat("Spline knots (months remaining):", round(knots, 2), "\n")
+
+pops <- list(`All girls (ITT)` = an %>% filter(pop_itt),
+             `Randomized girls` = an %>% filter(pop_randomized))
+strata <- c("Overall", "Mali", "CIV")
+sub_country <- function(d, s) if (s == "Overall") d else d %>% filter(country == s) %>% droplevels()
+grid <- expand_grid(population = names(pops), stratum = strata)
+unknown_pct <- an %>% filter(pop_itt) %>% group_by(arm) %>%
+  summarise(pct_unknown = 100 * mean(is.na(HPV_vaccinated)))
+mi_required <- any(unknown_pct$pct_unknown > 10)
+kbl(unknown_pct, 1, caption = "Unknown phase 1 status by arm (ITT); MI is required if >10% in either arm")
+```
+
+# Participant flow (Figure 3 data)
+
+```{r consort}
+flow <- an %>% group_by(country, arm) %>%
+  summarise(allocated = n(),
+            `by age-out rule` = sum(ageout),
+            `excluded at eligibility review` = sum(eligible_final == 0),
+            `analysed population (mITT)` = sum(pop_itt),
+            `phase 1 status known` = sum(pop_itt & status_known_phase1 == 1),
+            `unknown: 1 deactivated/deceased/moved` = sum(pop_itt & unknown_reason %in% "1"),
+            `unknown: 2 no information source` = sum(pop_itt & unknown_reason %in% "2"),
+            `unknown: 3a aged out` = sum(pop_itt & unknown_reason %in% "3a"),
+            `unknown: 3c not reached in time` = sum(pop_itt & unknown_reason %in% "3c"),
+            `unknown: 4 parents refused` = sum(pop_itt & unknown_reason %in% "4"),
+            `phase 2 status known` = sum(pop_itt & status_known_phase2 == 1), .groups = "drop")
+flow %>% pivot_longer(-c(country, arm)) %>% pivot_wider(names_from = c(country, arm), values_from = value) %>%
+  save_tbl("fig3_consort_counts") %>% kbl(caption = "CONSORT flow counts")
+```
+
+# Baseline characteristics (Table 1)
+
+```{r table1}
+t1_one <- function(d) {
+  g <- d$arm01
+  bin <- function(x, lab) tibble(variable = lab,
+    Intervention = sprintf("%d (%.1f%%)", sum(x[g == 1], na.rm = TRUE), 100 * mean(x[g == 1], na.rm = TRUE)),
+    Control = sprintf("%d (%.1f%%)", sum(x[g == 0], na.rm = TRUE), 100 * mean(x[g == 0], na.rm = TRUE)),
+    SMD = smd(as.numeric(x), g))
+  cont <- function(x, lab) tibble(variable = lab,
+    Intervention = sprintf("%.1f (%.1f); %.1f [%.1f-%.1f]", mean(x[g == 1], na.rm = TRUE), sd(x[g == 1], na.rm = TRUE),
+                           median(x[g == 1], na.rm = TRUE), quantile(x[g == 1], .25, na.rm = TRUE), quantile(x[g == 1], .75, na.rm = TRUE)),
+    Control = sprintf("%.1f (%.1f); %.1f [%.1f-%.1f]", mean(x[g == 0], na.rm = TRUE), sd(x[g == 0], na.rm = TRUE),
+                      median(x[g == 0], na.rm = TRUE), quantile(x[g == 0], .25, na.rm = TRUE), quantile(x[g == 0], .75, na.rm = TRUE)),
+    SMD = smd(x, g))
+  bind_rows(
+    tibble(variable = "N", Intervention = as.character(sum(g == 1)), Control = as.character(sum(g == 0)), SMD = NA),
+    cont(d$age_years, "Age at launch, years: mean (SD); median [IQR]"),
+    cont(d$months_remaining, "Months remaining in eligibility window: mean (SD); median [IQR]"),
+    bin(d$ageout, "Allocated by the age-out rule"),
+    bin(d$prior_vacc == 1, "HPV-vaccinated before launch (prior_vacc = 1)"),
+    bin(is.na(d$prior_vacc), "Vaccination status at launch unknown"),
+    bin(d$dob_approx, "Date of birth approximated"),
+    map_dfr(levels(droplevels(d$site)), ~ bin(d$site == .x, paste("Site:", .x))))
+}
+t1 <- map_dfr(c("Overall", "Mali", "CIV"), ~ t1_one(sub_country(pops[[1]], .x)) %>% mutate(stratum = .x, .before = 1))
+save_tbl(t1, "table1_baseline") %>% kbl(2, caption = "Table 1. Baseline characteristics by arm (ITT). SMD = standardized mean difference.")
+```
+
+# Coverage at baseline and at 12 weeks (Table 2)
+
+Coverage among girls with known status, Wilson 95% CI; difference with the
+Newcombe hybrid score CI; relative difference as a risk ratio. The "Overall"
+rows pool both countries crudely: because the age-out allocation adds Mali girls
+to the intervention arm only, the country mix differs between arms and the
+crude overall difference is confounded by country. Interpret the country rows
+and the adjusted estimates in Table 3.
+
+```{r table2}
+t2 <- pmap_dfr(grid, function(population, stratum) {
+  d <- sub_country(pops[[population]], stratum)
+  bind_rows(unadjusted(d %>% mutate(base = prior_vacc), "base") %>% mutate(timepoint = "Baseline (before launch)"),
+            unadjusted(d, "HPV_vaccinated") %>% mutate(timepoint = "12 weeks (1 July 2026)")) %>%
+    mutate(population = population, stratum = stratum, .before = 1)
+})
+save_tbl(t2, "table2_coverage")
+t2 %>% transmute(population, stratum, timepoint,
+                 Intervention = sprintf("%d/%d, %s", vacc_int, n_int, fmt_pp(cov_int, cov_int_lo, cov_int_hi)),
+                 Control = sprintf("%d/%d, %s", vacc_ctl, n_ctl, fmt_pp(cov_ctl, cov_ctl_lo, cov_ctl_hi)),
+                 `Difference, pp (95% CI)` = fmt_pp(diff, diff_lo, diff_hi),
+                 `RR (95% CI)` = fmt_ci(RR, RR_lo, RR_hi), `p` = fmt_p(p), test) %>%
+  kbl(caption = "Table 2. HPV vaccination coverage by arm (%; 95% CI)")
+```
+
+# Primary analysis: coverage at 12 weeks (Table 3)
+
+Mixed-effects logistic regression: `vaccinated ~ arm + country + rcs(months
+remaining, 3 knots) + (1 | CHW supervision zone)`. ARD and RR by marginal
+standardization (average over the observed covariates, delta-method CI). The
+**single confirmatory test** is the ITT overall OR at α = 0.05.
+
+```{r primary}
+outcomes_p1 <- list(
+  `Coverage at 12 weeks` = list(var = "HPV_vaccinated", filter = function(d) d),
+  `Uptake at 12 weeks among girls unvaccinated at launch (supplementary)` =
+    list(var = "HPV_vaccinated", filter = function(d) d %>% filter(prior_vacc %in% 0L)))
+prim <- list()
+t3 <- pmap_dfr(expand_grid(outcome = names(outcomes_p1), grid), function(outcome, population, stratum) {
+  d <- outcomes_p1[[outcome]]$filter(sub_country(pops[[population]], stratum))
+  r <- fit_glmer(d, outcomes_p1[[outcome]]$var, label = outcome)
+  prim[[paste(outcome, population, stratum, sep = " | ")]] <<- r$fit
+  u <- unadjusted(d, outcomes_p1[[outcome]]$var)
+  r$summary %>% mutate(outcome = outcome, population = population, stratum = stratum,
+                       OR_unadj = u$OR %||% NA, OR_unadj_lo = u$OR_lo %||% NA, OR_unadj_hi = u$OR_hi %||% NA,
+                       RR_unadj = u$RR %||% NA, RR_unadj_lo = u$RR_lo %||% NA, RR_unadj_hi = u$RR_hi %||% NA,
+                       ARD_unadj = u$diff %||% NA, ARD_unadj_lo = u$diff_lo %||% NA, ARD_unadj_hi = u$diff_hi %||% NA,
+                       p_unadj = u$p %||% NA, test_unadj = u$test %||% NA, .before = 1)
+})
+save_tbl(t3, "table3_primary")
+show_t3 <- function(t) t %>% transmute(outcome, population, stratum, n,
+  `Vaccinated I/C` = sprintf("%d / %d", events_int, events_ctl),
+  `Adjusted OR` = fmt_ci(OR, OR_lo, OR_hi), p = fmt_p(p),
+  `ARD, pp` = fmt_pp(ARD, ARD_lo, ARD_hi), `RR` = fmt_ci(RR, RR_lo, RR_hi),
+  `Unadjusted OR` = fmt_ci(OR_unadj, OR_unadj_lo, OR_unadj_hi),
+  `Unadj. ARD, pp` = fmt_pp(ARD_unadj, ARD_unadj_lo, ARD_unadj_hi),
+  `Unadj. RR` = fmt_ci(RR_unadj, RR_unadj_lo, RR_unadj_hi),
+  `p (unadj.)` = fmt_p(p_unadj), ICC = round(ICC, 3), note)
+kbl(show_t3(t3), caption = "Table 3. Primary and supplementary analyses (Table 5 = country rows)")
+```
+
+```{r confirmatory, results = "asis"}
+cf <- t3 %>% filter(outcome == "Coverage at 12 weeks", population == "All girls (ITT)", stratum == "Overall")
+cat(sprintf("**Confirmatory result (ITT, both countries):** adjusted OR %s, p = %s; ARD %s percentage points; RR %s. ",
+            fmt_ci(cf$OR, cf$OR_lo, cf$OR_hi), fmt_p(cf$p), fmt_pp(cf$ARD, cf$ARD_lo, cf$ARD_hi),
+            fmt_ci(cf$RR, cf$RR_lo, cf$RR_hi)))
+rd <- t3 %>% filter(outcome == "Coverage at 12 weeks", population == "Randomized girls", stratum == "Overall")
+cat(sprintf("Randomized girls only: OR %s (read together with the ITT estimate; it takes precedence for causal interpretation if the two diverge).\n",
+            fmt_ci(rd$OR, rd$OR_lo, rd$OR_hi)))
+```
+
+## Effect modification by country for uptake (arm × country)
+
+```{r uptake_interaction}
+map_dfr(names(pops), function(pp) {
+  d <- pops[[pp]] %>% filter(prior_vacc %in% 0L, !is.na(HPV_vaccinated), !is.na(age_s1))
+  f0 <- glmer(HPV_vaccinated ~ arm01 + country + age_s1 + age_s2 + (1 | chw_zone), d, binomial, control = ctrl_glmer)
+  f1 <- update(f0, . ~ . + arm01:country)
+  tibble(population = pp, outcome = "Uptake at 12 weeks", LRT_p_interaction = anova(f0, f1)$`Pr(>Chisq)`[2])
+}) %>% kbl()
+```
+
+## Model diagnostics and clustering
+
+```{r diagnostics}
+pf <- prim[["Coverage at 12 weeks | All girls (ITT) | Overall"]]
+diagnostics(pf) %>% kbl(caption = "Primary model: discrimination (AUC), Hosmer-Lemeshow (10 groups), VIF")
+if (inherits(pf, "merMod")) print(summary(pf))
+```
+
+```{r caterpillar, fig.height = 7}
+if (inherits(pf, "merMod")) {
+  re <- as.data.frame(ranef(pf, condVar = TRUE)) %>%
+    mutate(lo = condval - 1.96 * condsd, hi = condval + 1.96 * condsd,
+           grp = reorder(grp, condval))
+  ggplot(re, aes(condval, grp)) + geom_vline(xintercept = 0, colour = "grey60") +
+    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0, colour = "grey50") + geom_point(colour = pal[2]) +
+    labs(x = "CHW-zone random intercept (log-odds) with 95% interval", y = NULL,
+         title = "Figure 6. Caterpillar plot of CHW-zone random effects") +
+    theme(axis.text.y = element_blank())
+}
+```
+
+# Secondary analysis: time to vaccination over 12 weeks (Table 4, Figure 4)
+
+Girls unvaccinated at launch only. Event: documented vaccination by 1 July;
+known unvaccinated girls censored at the end of the 12-week time frame; girls
+with unknown status censored at `last_status_date`. RMST difference at τ = the
+country day count of 1 July (Mali 84 days; CIV 83 days by date difference); the
+pooled analysis uses τ = 84.
+
+```{r tte}
+tte_res <- list()
+t4 <- pmap_dfr(grid, function(population, stratum) {
+  d <- sub_country(pops[[population]], stratum) %>% filter(prior_vacc %in% 0L, !is.na(age_s1))
+  tau <- if (stratum == "Overall") 84 else unique(d$tau_p1)[1]
+  s <- surv_by_arm(d, tau); cx <- fit_cox(d)
+  tte_res[[paste(population, stratum)]] <<- list(surv = s, cox = cx, data = d)
+  cum <- s$cum %>% mutate(lab = sprintf("%s wk %s", round(day / 7), arm),
+                          val = fmt_pp(cum_vacc, lo, hi)) %>% select(lab, val) %>% tibble::deframe()
+  tibble(population = population, stratum = stratum, n = nrow(d), events = sum(d$event_p1),
+         tau = tau,
+         `RMST Intervention` = s$rmst$rmean[s$rmst$arm == "Intervention"],
+         `RMST Control` = s$rmst$rmean[s$rmst$arm == "Control"],
+         dRMST = s$dRMST$dRMST, dRMST_lo = s$dRMST$lo, dRMST_hi = s$dRMST$hi, dRMST_p = s$dRMST$p,
+         logrank_p = s$logrank_p,
+         median_I = s$rmst$median[s$rmst$arm == "Intervention"], median_C = s$rmst$median[s$rmst$arm == "Control"]) %>%
+    bind_cols(cx$summary %>% rename_with(~ paste0("Cox_", .x)), as_tibble(as.list(cum)))
+})
+# Country-standardized overall dRMST (weights = country share of the TTE population),
+# because the age-out allocation makes the country mix differ between arms
+t4 <- t4 %>% group_by(population) %>%
+  mutate(w = if_else(stratum == "Overall", NA_real_, n / sum(n[stratum != "Overall"])),
+         se_c = (dRMST_hi - dRMST_lo) / (2 * 1.96),
+         dRMST_std = if_else(stratum == "Overall", sum((w * dRMST)[stratum != "Overall"]), NA_real_),
+         se_std = if_else(stratum == "Overall", sqrt(sum((w^2 * se_c^2)[stratum != "Overall"])), NA_real_),
+         dRMST_std_lo = dRMST_std - 1.96 * se_std, dRMST_std_hi = dRMST_std + 1.96 * se_std) %>%
+  ungroup() %>% select(-w, -se_c, -se_std)
+save_tbl(t4, "table4_secondary_tte")
+t4 %>% mutate(`dRMST, days (95% CI)` = fmt_ci(dRMST, dRMST_lo, dRMST_hi),
+         `dRMST country-standardized` = ifelse(is.na(dRMST_std), "", fmt_ci(dRMST_std, dRMST_std_lo, dRMST_std_hi)),
+              `aHR (95% CI)` = fmt_ci(Cox_HR, Cox_HR_lo, Cox_HR_hi)) %>%
+  select(population, stratum, n, events, tau, `RMST Intervention`, `RMST Control`, `dRMST, days (95% CI)`,
+         `dRMST country-standardized`, dRMST_p, logrank_p, `aHR (95% CI)`, Cox_p, Cox_PH_p_arm, median_I, median_C,
+         starts_with("4 wk"), starts_with("8 wk"), starts_with("12 wk")) %>%
+  kbl(caption = "Table 4. Cumulative proportion vaccinated (%), RMST (days unvaccinated out of tau), Cox aHR")
+```
+
+ΔRMST < 0 means girls in the intervention arm spent fewer of the first 12 weeks
+unvaccinated (earlier vaccination). CIs use the Greenwood-based variance of the
+Kaplan-Meier RMST; if the `survRM2` package is installed, the Uno et al. (2014)
+estimate is added to `table4_secondary_tte.csv` as a cross-check.
+
+```{r km_plot, fig.height = 5}
+km_plot <- function(key_fun, tmax, title, cross = NULL) {
+  df <- map_dfr(c("Mali", "CIV"), function(cn) km_df(key_fun(cn)) %>% mutate(country = cn))
+  p <- ggplot(df, aes(time, cum, colour = arm, fill = arm)) +
+    geom_step(linewidth = .8) + facet_wrap(~ country, scales = "free_y") +
+    scale_colour_manual(values = pal) + scale_fill_manual(values = pal) +
+    scale_y_continuous(labels = scales::percent) + coord_cartesian(xlim = c(0, tmax)) +
+    labs(x = "Days since launch", y = "Cumulative proportion vaccinated", colour = NULL, fill = NULL, title = title)
+  if (!is.null(cross)) p <- p + geom_vline(xintercept = cross, linetype = 2, colour = "grey40") +
+    annotate("text", x = cross, y = Inf, label = " crossover 2 July", hjust = 0, vjust = 1.5, size = 3)
+  p
+}
+km_plot(function(cn) tte_res[[paste("All girls (ITT)", cn)]]$surv$fit, 84,
+        "Figure 4a. Time to HPV vaccination, 12-week time frame (girls unvaccinated at launch, ITT)")
+```
+
+## Proportional hazards checks
+
+```{r ph, fig.height = 4.5}
+zp <- tte_res[["All girls (ITT) Overall"]]$cox$zph
+if (!is.null(zp)) print(zp)
+d <- tte_res[["All girls (ITT) Overall"]]$data
+ll <- km_df(survfit(Surv(time_p1, event_p1) ~ arm, data = d)) %>% filter(time > 0, cum < 1, cum > 0)
+ggplot(ll, aes(log(time), log(-log(1 - cum)), colour = arm)) + geom_step() + scale_colour_manual(values = pal) +
+  labs(title = "Log(-log) survival by arm (parallel curves support proportional hazards)", colour = NULL)
+# If PH is violated for arm: piecewise hazard ratios over weeks 0-4, 5-8, 9-12
+if (!is.null(zp) && zp$table["arm01", "p"] < 0.05) {
+  sp <- split_periods(d, rep(list(c(28, 56)), nrow(d)), "time_p1", "event_p1")
+  pw <- fit_cox_period(sp, c("weeks 0-4", "weeks 5-8", "weeks 9-12"))
+  kbl(pw$summary, caption = sprintf("Piecewise HR (PH violated); equality p = %s", fmt_p(pw$interaction_p)))
+}
+```
+
+## Censoring conditioned on cause
+
+Deaths as a competing event (Aalen-Johansen) if not negligible (> 1% of girls in
+the time-to-event population), and girls who aged out (cause 3a) bounded.
+
+```{r tte_cause}
+d <- tte_res[["All girls (ITT) Overall"]]$data
+dd <- d %>% mutate(dtime = as.numeric(death_date - study_dates$launch[as.character(country)]),
+                   status = case_when(event_p1 == 1 ~ 1L,
+                                      death & !is.na(dtime) & dtime <= tau_p1 ~ 2L, TRUE ~ 0L),
+                   ctime = if_else(status == 2L, pmax(dtime, 0.5), time_p1))
+cat("Deaths in the time-to-event population:", sum(dd$status == 2), "of", nrow(dd), "\n")
+if (mean(dd$status == 2) > 0.01) {
+  aj <- survfit(Surv(ctime, factor(status, 0:2, c("censor", "vaccinated", "death"))) ~ arm, data = dd)
+  print(summary(aj, times = 84, extend = TRUE))
+} else cat("Deaths are negligible: Kaplan-Meier estimates retained.\n")
+
+bound_3a <- function(d, case) {
+  w <- is.na(d$HPV_vaccinated) & d$unknown_reason %in% "3a"
+  good <- if (case == "best") d$arm01 == 1 else d$arm01 == 0   # arm assumed vaccinated
+  d$event_p1[w & good] <- 1L
+  d$time_p1[w & good]  <- pmin(d$tau_p1[w & good], pmax(0.5, d$time_p1[w & good] + 1))
+  d$event_p1[w & !good] <- 0L; d$time_p1[w & !good] <- d$tau_p1[w & !good]
+  d
+}
+map_dfr(c("worst", "best"), function(cs) {
+  b <- bound_3a(d, cs); s <- surv_by_arm(b, 84); cx <- fit_cox(b)
+  tibble(scenario = paste(cs, "case for intervention (3a)"), girls_3a = sum(d$unknown_reason %in% "3a"),
+         `dRMST (95% CI)` = fmt_ci(s$dRMST$dRMST, s$dRMST$lo, s$dRMST$hi),
+         `aHR (95% CI)` = fmt_ci(cx$summary$HR, cx$summary$HR_lo, cx$summary$HR_hi))
+}) %>% kbl()
+```
+
+# Sensitivity analyses (Table 7)
+
+```{r sens_setup}
+itt <- pops[["All girls (ITT)"]]
+sens <- list()
+add_sens <- function(name, s) sens[[name]] <<- s %>% mutate(scenario = name, .before = 1)
+add_sens("Primary (complete case, ITT)", t3 %>% filter(outcome == "Coverage at 12 weeks",
+         population == "All girls (ITT)", stratum == "Overall") %>% select(n, OR, OR_lo, OR_hi, p, ARD, ARD_lo, ARD_hi))
+add_sens("Randomized girls only", t3 %>% filter(outcome == "Coverage at 12 weeks",
+         population == "Randomized girls", stratum == "Overall") %>% select(n, OR, OR_lo, OR_hi, p, ARD, ARD_lo, ARD_hi))
+u <- unadjusted(itt, "HPV_vaccinated")
+add_sens(paste("Unadjusted", u$test, "test"), tibble(n = u$n_int + u$n_ctl, OR = u$OR, OR_lo = u$OR_lo, OR_hi = u$OR_hi,
+         p = u$p, ARD = u$diff, ARD_lo = u$diff_lo, ARD_hi = u$diff_hi))
+```
+
+## Site and arm × country
+
+```{r sens_site}
+fs <- glmer(HPV_vaccinated ~ arm01 * country + site + age_s1 + age_s2 + (1 | chw_zone),
+            data = itt %>% filter(!is.na(HPV_vaccinated), !is.na(age_s1)), family = binomial, control = ctrl_glmer)
+f0 <- update(fs, . ~ . - arm01:country)
+b <- fixef(fs); V <- vcov(fs)
+or_c <- function(L) { e <- sum(L * b[names(L)]); s <- sqrt(drop(t(L) %*% V[names(L), names(L)] %*% L))
+  c(OR = exp(e), lo = exp(e - 1.96 * s), hi = exp(e + 1.96 * s), p = 2 * pnorm(-abs(e / s))) }
+site_tab <- rbind(Mali = or_c(c(arm01 = 1)), CIV = or_c(c(arm01 = 1, `arm01:countryCIV` = 1)))
+kbl(as.data.frame(site_tab), caption = sprintf("OR by country from the model with site and arm x country; interaction LRT p = %s",
+                                               fmt_p(anova(f0, fs)$`Pr(>Chisq)`[2])))
+add_sens("Adjusted for site, with arm x country (Mali OR)", tibble(n = nobs(fs), OR = site_tab["Mali", "OR"],
+         OR_lo = site_tab["Mali", "lo"], OR_hi = site_tab["Mali", "hi"], p = site_tab["Mali", "p"]))
+add_sens("Adjusted for site, with arm x country (CIV OR)", tibble(n = nobs(fs), OR = site_tab["CIV", "OR"],
+         OR_lo = site_tab["CIV", "lo"], OR_hi = site_tab["CIV", "hi"], p = site_tab["CIV", "p"]))
+```
+
+## Kaplan-Meier coverage at 12 weeks
+
+Coverage = π + (1 − π)[1 − Ŝ(τ)], π = proportion vaccinated before launch in
+the arm; Greenwood-based CI, bootstrap percentile CI as a cross-check. Computed
+by country (τ = 84 days Mali, 83 days CIV); the overall estimate is
+standardized to the country distribution of the population, because the
+age-out allocation makes the country mix differ between arms.
+
+```{r sens_km}
+kmc <- map_dfr(names(pops), function(pp)
+  km_coverage_std(pops[[pp]], "tau_p1", "time_p1", "event_p1", B = params$boot_B) %>%
+    mutate(population = pp, .before = 1))
+save_tbl(kmc, "sens_km_coverage_12wk") %>% kbl(4)
+add_sens("Kaplan-Meier coverage at 12 weeks (difference, country-standardized)", kmc %>% filter(population == "All girls (ITT)", stratum == "Overall (country-standardized)") %>%
+           transmute(ARD = diff, ARD_lo = diff_lo, ARD_hi = diff_hi))
+```
+
+## Verification timing
+
+```{r sens_timing}
+r_a <- fit_glmer(itt, "HPV_vaccinated_aug30", label = "verified by 30 August")
+# (b) verification_lag is defined for girls verified at a visit in the 2 July - 1 October window;
+# girls known only from a dose documented before 1 July have no verification visit and are
+# not included (giving them a lag of 0 would tie the covariate to the outcome).
+r_b <- fit_glmer(itt %>% filter(!is.na(verification_lag)) %>% mutate(lag = verification_lag / 30),
+                 "HPV_vaccinated", extra = "lag", label = "verification_lag covariate (per 30 days)")
+cat("Complete-case girls without a verification visit in the window (excluded from (b)):",
+    sum(!is.na(itt$HPV_vaccinated) & is.na(itt$verification_lag)), "\n")
+bind_rows(r_a$summary, r_b$summary) %>% select(analysis, n, OR, OR_lo, OR_hi, p, ARD, ARD_lo, ARD_hi, note) %>% kbl()
+itt %>% filter(status_known_phase1 == 1) %>% group_by(arm) %>%
+  summarise(n = n(), `verified at a window visit` = sum(!is.na(verification_lag)),
+            `median lag, days [IQR]` = sprintf("%.0f [%.0f-%.0f]", median(verification_lag, na.rm = TRUE),
+              quantile(verification_lag, .25, na.rm = TRUE), quantile(verification_lag, .75, na.rm = TRUE)),
+            `verified by 30 Aug` = sum(verified_by_30aug)) %>% kbl(caption = "Verification timing by arm")
+add_sens("Status verified by 30 August 2026", r_a$summary %>% select(n, OR, OR_lo, OR_hi, p, ARD, ARD_lo, ARD_hi))
+add_sens("Adjusted for verification lag", r_b$summary %>% select(n, OR, OR_lo, OR_hi, p, ARD, ARD_lo, ARD_hi))
+```
+
+## Unknown status by cause (Table 6) and informative missingness
+
+```{r table6}
+t6 <- an %>% filter(pop_itt | eligible_final == 0) %>%
+  pivot_longer(c(unknown_reason, unknown_reason_phase2), names_to = "timepoint", values_to = "cause") %>%
+  mutate(timepoint = if_else(timepoint == "unknown_reason", "Phase 1 (1 July)", "Phase 2 (1 October)")) %>%
+  group_by(timepoint, country, arm) %>%
+  summarise(N = n(), excluded_review = sum(eligible_final == 0),
+            `1` = sum(cause %in% "1" & pop_itt), `2` = sum(cause %in% "2" & pop_itt),
+            `3a` = sum(cause %in% "3a" & pop_itt), `3c` = sum(cause %in% "3c" & pop_itt),
+            `4` = sum(cause %in% "4" & pop_itt), .groups = "drop") %>%
+  mutate(`% unknown (after review)` = round(100 * (`1` + `2` + `3a` + `3c` + `4`) / (N - excluded_review), 1))
+save_tbl(t6, "table6_unknown_by_cause") %>% kbl(1, caption = "Table 6. Unknown status by arm, timepoint and cause")
+ct <- table(itt$arm[!is.na(itt$unknown_reason)], itt$unknown_reason[!is.na(itt$unknown_reason)])
+if (all(dim(ct) > 1)) cat("Chi-squared test, cause distribution by arm (phase 1): p =",
+                          fmt_p(suppressWarnings(chisq.test(ct)$p.value)), "\n")
+
+# Baseline characteristics: known vs unknown status, overall and by cause
+itt %>% mutate(group = coalesce(paste("unknown, cause", unknown_reason), "known")) %>%
+  group_by(group) %>%
+  summarise(n = n(), intervention = mean(arm01), age_years = mean(age_years, na.rm = TRUE),
+            months_remaining = mean(months_remaining, na.rm = TRUE), aged_out_alloc = mean(ageout),
+            prior_vacc = mean(prior_vacc, na.rm = TRUE), contacts = mean(n_contacts)) %>%
+  kbl(2, caption = "Girls with known vs unknown phase 1 status (means/proportions)")
+```
+
+## Multiple imputation (cause 3c) and delta tipping point (cause 2)
+
+Imputation model: arm, country, age spline, site, CHW-zone mean coverage
+(cluster mean of observed outcomes), number of CHW contacts, days from launch
+to last documented status. `baseline vaccination status of household
+children` is listed in the SAP but is not in the four CHT tables; add it here
+if a household-level extract becomes available.
+
+```{r mi}
+mi_out <- NULL
+if (params$run_mi) {
+  if (!mi_required) cat("Unknown status is <=10% in both arms: MI not required by the SAP; run as supportive.\n")
+  base_mi <- itt %>% filter(!is.na(age_s1)) %>%
+    mutate(days_last = coalesce(as.numeric(last_status_date - study_dates$launch[as.character(country)]), 0)) %>%
+    group_by(chw_zone) %>%
+    mutate(zone_cov = (sum(HPV_vaccinated, na.rm = TRUE) - coalesce(HPV_vaccinated, 0L)) /
+             pmax(1, sum(!is.na(HPV_vaccinated)) - !is.na(HPV_vaccinated))) %>% ungroup()
+  rhs_imp <- "arm01 + country + age_s1 + age_s2 + site + zone_cov + n_contacts + days_last"
+  if (n_distinct(base_mi$country) < 2) rhs_imp <- sub("country \\+ ", "", rhs_imp)
+  fit_pool <- function(dlist) {
+    est <- map(dlist, function(d) { r <- fit_glmer(d, "y"); c(r$summary$logOR, r$summary$se_logOR) })
+    pool_rubin(map_dbl(est, 1), map_dbl(est, 2))
+  }
+  # (i) main MI: cause 3c imputed with mice (logistic regression), m imputations
+  d3c <- base_mi %>% filter(!is.na(HPV_vaccinated) | unknown_reason %in% "3c") %>%
+    mutate(y = factor(HPV_vaccinated))
+  vars <- c("y", all.vars(as.formula(paste("~", rhs_imp))))
+  ini <- mice(d3c[, vars], maxit = 0)
+  meth <- ini$method; meth[] <- ""; meth["y"] <- "logreg"
+  pred <- ini$predictorMatrix; pred[,] <- 0; pred["y", setdiff(vars, "y")] <- 1
+  imp <- mice(d3c[, vars], m = params$mi_m, method = meth, predictorMatrix = pred, printFlag = FALSE,
+              seed = params$seed)
+  dl <- map(seq_len(params$mi_m), function(k) {
+    x <- d3c; x$y <- as.integer(as.character(complete(imp, k)$y)); x })
+  mi_main <- fit_pool(dl) %>% mutate(analysis = "MI: cause 3c imputed (MAR)", n = nrow(d3c),
+                                     imputed = sum(is.na(d3c$y)), delta = NA_real_)
+  # (ii) delta-adjusted MI: causes 3c (delta = 0) and 2 (delta shift on log-odds)
+  d2 <- base_mi %>% filter(!is.na(HPV_vaccinated) | unknown_reason %in% c("2", "3c")) %>%
+    mutate(y = HPV_vaccinated)
+  deltas <- as.numeric(strsplit(params$delta_grid, ",")[[1]])
+  mi_delta <- map_dfr(deltas, function(dl0) {
+    lst <- impute_delta(d2, rhs_imp, shift = d2$unknown_reason %in% "2", delta = dl0, m = params$mi_m)
+    fit_pool(lst) %>% mutate(analysis = "MI: causes 2 (delta-shifted) and 3c", n = nrow(d2),
+                             imputed = sum(is.na(d2$y)), delta = dl0)
+  })
+  mi_out <- bind_rows(mi_main, mi_delta)
+  save_tbl(mi_out, "sens_multiple_imputation") %>% kbl(caption = "Multiple imputation (Rubin's rules)")
+  tip <- mi_delta %>% filter(p >= 0.05 | OR_lo <= 1)
+  cat("Tipping point (first delta at which the effect is no longer significant):",
+      if (nrow(tip)) tip$delta[1] else "not reached in the grid", "\n")
+  add_sens("MI, cause 3c (MAR)", mi_main %>% select(n, OR, OR_lo, OR_hi, p))
+  walk(seq_len(nrow(mi_delta)), function(i) add_sens(sprintf("MI, causes 2 and 3c, delta = %s", mi_delta$delta[i]),
+                                                     mi_delta[i, ] %>% select(n, OR, OR_lo, OR_hi, p)))
+}
+```
+
+## Bounding (Manski) analysis
+
+```{r manski}
+versions <- list(`(a) causes 1, 2, 3a, 4` = c("1", "2", "3a", "4"), `(b) cause 3a only` = "3a",
+                 `(c) all unknown statuses` = c("1", "2", "3a", "3c", "4"))
+mk <- map_dfr(names(versions), function(v) map_dfr(c("worst", "best"), function(cs) {
+  d <- manski_data(itt, "HPV_vaccinated", "unknown_reason", versions[[v]], cs)
+  r <- fit_glmer(d, "y_bound", label = paste(v, cs))
+  u <- unadjusted(d, "y_bound")
+  r$summary %>% transmute(version = v, case = paste(cs, "case for intervention"), n, OR, OR_lo, OR_hi, p,
+                          diff = u$diff, diff_lo = u$diff_lo, diff_hi = u$diff_hi, note)
+}))
+save_tbl(mk, "sens_manski_bounds") %>% kbl(caption = "Manski bounds (OR from the primary model; difference unadjusted)")
+walk(seq_len(nrow(mk)), function(i) add_sens(paste("Bounds", mk$version[i], mk$case[i]),
+                                             mk[i, ] %>% select(n, OR, OR_lo, OR_hi, p)))
+```
+
+## Girls excluded at the eligibility review retained
+
+```{r sens_review}
+allr <- an %>% filter(!is.na(age_s1)) %>%
+  mutate(unknown_reason = if_else(eligible_final == 0 & is.na(HPV_vaccinated), "3b", unknown_reason))
+er <- map_dfr(c("worst", "best"), function(cs) {
+  d <- manski_data(allr, "HPV_vaccinated", "unknown_reason", "3b", cs)
+  fit_glmer(d, "y_bound")$summary %>% mutate(case = cs)
+})
+kbl(er %>% select(case, n, OR, OR_lo, OR_hi, p), caption = sprintf("Excluded girls retained (%d girls), unknown status bounded",
+                                                                   sum(an$eligible_final == 0)))
+walk(seq_len(nrow(er)), function(i) add_sens(paste("Eligibility exclusions retained,", er$case[i], "case"),
+                                             er[i, ] %>% select(n, OR, OR_lo, OR_hi, p)))
+```
+
+## Summary of sensitivity analyses
+
+```{r table7}
+t7 <- bind_rows(sens)
+save_tbl(t7, "table7_sensitivity_summary")
+t7 %>% transmute(scenario, n, `OR (95% CI)` = ifelse(is.na(OR), "", fmt_ci(OR, OR_lo, OR_hi)), p = fmt_p(p),
+                 `Difference, pp (95% CI)` = ifelse(is.na(ARD), "", fmt_pp(ARD, ARD_lo, ARD_hi)),
+                 `OR change vs primary` = ifelse(is.na(OR), "", sprintf("%+.1f%%", 100 * (OR / t7$OR[1] - 1)))) %>%
+  kbl(caption = "Table 7. Sensitivity analyses (material change: OR differs by >10% or significance changes)")
+```
+
+# Subgroups (Figure 5)
+
+Pre-specified country subgroups, plus age group within Côte d'Ivoire and site,
+for (a) coverage at 12 weeks and (b) uptake at 12 weeks among girls
+unvaccinated at launch (`prior_vacc = 0`). Each subgroup is fitted with the
+primary model (country term dropped within a country). Exploratory, 95% CIs
+without multiplicity adjustment. Subgroups without a stable estimate are kept in
+the CSV, with the reason in `why_not`, and left out of the plot: not estimable, fewer than 5
+vaccinated girls in either arm, or an unstable fit (standard error of the log-OR
+outside 0.01–3). The threshold is set by `min_events` in `flag_subgroups()`.
+
+```{r subgroup_fun}
+run_subgroups <- function(dat, outcome = "HPV_vaccinated") {
+  bind_rows(
+    map_dfr(c("Mali", "CIV"), ~ fit_glmer(sub_country(dat, .x), outcome, label = .x)$summary %>%
+              mutate(group = "Country")),
+    map_dfr(c("9-11", "12-14"), function(a) {
+      rng <- if (a == "9-11") 9:11 else 12:14
+      fit_glmer(dat %>% filter(country == "CIV", age_years %in% rng) %>% droplevels(), outcome,
+                label = paste0("CIV, age ", a, " years"))$summary %>% mutate(group = "Age (CIV)")
+    }),
+    map_dfr(levels(droplevels(dat$site)), ~ fit_glmer(dat %>% filter(site == .x) %>% droplevels(), outcome,
+                                                      label = paste("Site", .x))$summary %>% mutate(group = "Site"))) %>%
+    mutate(group = factor(group, levels = c("Country", "Age (CIV)", "Site")))
+}
+# A subgroup estimate is plotted only if it is stable: at least `min_events`
+# vaccinated girls in each arm and a well-behaved standard error. Others are
+# kept in the CSV and listed under the figure.
+flag_subgroups <- function(sg, min_events = 5) {
+  sg %>% mutate(plotted = !is.na(OR) & events_int >= min_events & events_ctl >= min_events &
+                  !is.na(se_logOR) & se_logOR > 0.01 & se_logOR < 3,
+                why_not = case_when(plotted ~ NA_character_,
+                                    is.na(OR) ~ "not estimable",
+                                    events_int < min_events | events_ctl < min_events ~
+                                      sprintf("fewer than %d vaccinated girls in an arm", min_events),
+                                    TRUE ~ "unstable model fit"))
+}
+plot_subgroups <- function(sg, overall, title) {
+  d <- sg %>% filter(plotted) %>%
+    mutate(lab = sprintf("%s  (n = %s; %d/%d vaccinated)", analysis, format(n, big.mark = ","), events_int, events_ctl),
+           ci_txt = fmt_ci(OR, OR_lo, OR_hi))
+  lim <- c(min(d$OR_lo, overall$OR_lo, 1), max(d$OR_hi, overall$OR_hi, 1)) * c(0.8, 1.25)
+  brks <- c(0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64)
+  ggplot(d, aes(OR, reorder(lab, OR))) +
+    geom_vline(xintercept = 1, colour = "grey60") +
+    geom_vline(xintercept = overall$OR, linetype = 2, colour = "grey40") +
+    geom_errorbarh(aes(xmin = OR_lo, xmax = OR_hi), height = 0, colour = pal[2], linewidth = .7) +
+    geom_point(aes(size = n), colour = pal[2], show.legend = FALSE) + scale_size_area(max_size = 3.5) +
+    geom_text(aes(x = lim[2], label = ci_txt), hjust = -0.15, size = 3, colour = "grey25") +
+    scale_x_log10(breaks = brks, labels = format(brks, drop0trailing = TRUE)) +
+    coord_cartesian(xlim = lim, clip = "off") +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    labs(x = sprintf("Adjusted OR (log scale) with 95%% CI; dashed line = overall estimate, OR %s",
+                     fmt_ci(overall$OR, overall$OR_lo, overall$OR_hi)),
+         y = NULL, title = title,
+         subtitle = "Labels: n analysed; vaccinated intervention / control. Point size proportional to n.") +
+    theme(strip.text.y.left = element_text(angle = 0, hjust = 0, face = "bold"), plot.title.position = "plot",
+          strip.placement = "outside", panel.spacing.y = unit(8, "pt"),
+          plot.margin = margin(5.5, 120, 5.5, 5.5))
+}
+fig_h <- function(sg) 2 + 0.32 * max(1, sum(sg$plotted))
+```
+
+## (a) Coverage at 12 weeks
+
+```{r forest_cov}
+sg_cov <- run_subgroups(itt, "HPV_vaccinated") %>% flag_subgroups()
+save_tbl(sg_cov, "fig5a_subgroups_coverage")
+p5a <- plot_subgroups(sg_cov, cf, "Figure 5a. Subgroup-specific ORs: coverage at 12 weeks (ITT)")
+ggsave(file.path(params$out_dir, "fig5a_subgroups_coverage.png"), p5a, width = 10, height = fig_h(sg_cov), dpi = 300, bg = "white")
+sg_cov %>% filter(!plotted) %>% select(analysis, n, n_int, n_ctl, events_int, events_ctl, why_not) %>%
+  kbl(caption = "Coverage subgroups not plotted (estimates kept in the CSV)")
+```
+
+```{r forest_cov_show, fig.height = fig_h(sg_cov), fig.width = 10, echo = FALSE}
+p5a
+```
+
+## (b) Uptake at 12 weeks among girls unvaccinated at launch
+
+```{r forest_upt}
+cf_upt <- t3 %>% filter(outcome == names(outcomes_p1)[2], population == "All girls (ITT)", stratum == "Overall")
+sg_upt <- run_subgroups(itt %>% filter(prior_vacc %in% 0L), "HPV_vaccinated") %>% flag_subgroups()
+save_tbl(sg_upt, "fig5b_subgroups_uptake")
+p5b <- plot_subgroups(sg_upt, cf_upt,
+                      "Figure 5b. Subgroup-specific ORs: uptake at 12 weeks among girls unvaccinated at launch (ITT)")
+ggsave(file.path(params$out_dir, "fig5b_subgroups_uptake.png"), p5b, width = 10, height = fig_h(sg_upt), dpi = 300, bg = "white")
+sg_upt %>% filter(!plotted) %>% select(analysis, n, n_int, n_ctl, events_int, events_ctl, why_not) %>%
+  kbl(caption = "Uptake subgroups not plotted (estimates kept in the CSV)")
+```
+
+```{r forest_upt_show, fig.height = fig_h(sg_upt), fig.width = 10, echo = FALSE}
+p5b
+```
+
+# Phase 2: status on 1 October 2026 (Table 8)
+
+Randomized comparison of an early versus a delayed start of the intervention
+(the control arm crossed over on 2 July 2026). Exploratory.
+
+```{r phase2_cov}
+outcomes_p2 <- list(
+  `Coverage at 1 October` = function(d) d,
+  `Uptake by 1 October among girls unvaccinated at launch` = function(d) d %>% filter(prior_vacc %in% 0L),
+  `Coverage at 1 October, status from a visit on/after 2 July (sensitivity)` =
+    function(d) d %>% mutate(HPV_vaccinated_phase2 = HPV_vaccinated_phase2_recent))
+t8a <- pmap_dfr(expand_grid(outcome = names(outcomes_p2), grid), function(outcome, population, stratum) {
+  d <- outcomes_p2[[outcome]](sub_country(pops[[population]], stratum))
+  u <- unadjusted(d, "HPV_vaccinated_phase2")
+  fit_glmer(d, "HPV_vaccinated_phase2", label = outcome)$summary %>%
+    mutate(outcome = outcome, population = population, stratum = stratum,
+           cov_int = u$cov_int, cov_ctl = u$cov_ctl, .before = 1)
+})
+save_tbl(t8a, "table8a_phase2_coverage")
+t8a %>% transmute(outcome, population, stratum, n, `Coverage I` = sprintf("%.1f%%", 100 * cov_int),
+                  `Coverage C` = sprintf("%.1f%%", 100 * cov_ctl), `Adjusted OR` = fmt_ci(OR, OR_lo, OR_hi),
+                  p = fmt_p(p), `ARD, pp` = fmt_pp(ARD, ARD_lo, ARD_hi), RR = fmt_ci(RR, RR_lo, RR_hi), note) %>%
+  kbl(caption = "Table 8a. Coverage and uptake on 1 October 2026 by original arm")
+map_dfr(names(pops), function(pp) {
+  d <- pops[[pp]] %>% filter(prior_vacc %in% 0L, !is.na(HPV_vaccinated_phase2), !is.na(age_s1))
+  f0 <- glmer(HPV_vaccinated_phase2 ~ arm01 + country + age_s1 + age_s2 + (1 | chw_zone), d, binomial, control = ctrl_glmer)
+  tibble(population = pp, outcome = "Uptake by 1 October",
+         LRT_p_arm_x_country = anova(f0, update(f0, . ~ . + arm01:country))$`Pr(>Chisq)`[2])
+}) %>% kbl()
+
+kmc2 <- map_dfr(names(pops), function(pp)
+  km_coverage_std(pops[[pp]], "tau_p2", "time_p2", "event_p2") %>% mutate(population = pp, .before = 1))
+save_tbl(kmc2, "table8b_phase2_km_coverage") %>% kbl(4, caption = "Table 8b. Kaplan-Meier coverage on 1 October 2026")
+```
+
+## Change between 1 July and 1 October (GEE, arm × time)
+
+```{r gee}
+gee_one <- function(d, oct_var = "HPV_vaccinated_phase2") {
+  d$oct_status <- d[[oct_var]]
+  long <- d %>% filter(!is.na(age_s1)) %>%
+    select(girl_id, chw_zone, arm01, country, age_s1, age_s2, `0` = HPV_vaccinated, `1` = oct_status) %>%
+    pivot_longer(c(`0`, `1`), names_to = "oct", values_to = "y") %>%
+    filter(!is.na(y)) %>% mutate(oct = as.integer(oct), zid = as.integer(factor(chw_zone))) %>% arrange(zid, girl_id, oct)
+  f <- as.formula(paste("y ~ arm01 * oct", if (n_distinct(long$country) > 1) "+ country", "+ age_s1 + age_s2"))
+  g <- geeglm(f, id = zid, data = long, family = binomial, corstr = "exchangeable")
+  b <- coef(g); V <- vcov(g)
+  ctr <- function(L) { e <- sum(L * b[names(L)]); s <- sqrt(drop(t(L) %*% V[names(L), names(L)] %*% L))
+    sprintf("%s (p %s)", fmt_ci(exp(e), exp(e - 1.96 * s), exp(e + 1.96 * s)), fmt_p(2 * pnorm(-abs(e / s)))) }
+  tibble(`OR arm, 1 July` = ctr(c(arm01 = 1)), `OR arm, 1 October` = ctr(c(arm01 = 1, `arm01:oct` = 1)),
+         `OR Oct vs Jul, control` = ctr(c(oct = 1)), `OR Oct vs Jul, intervention` = ctr(c(oct = 1, `arm01:oct` = 1)),
+         `arm x time p` = fmt_p(2 * pnorm(-abs(b["arm01:oct"] / sqrt(V["arm01:oct", "arm01:oct"])))))
+}
+t8c <- pmap_dfr(expand_grid(definition = c("HPV_vaccinated_phase2", "HPV_vaccinated_phase2_recent"), grid),
+  function(definition, population, stratum)
+    gee_one(sub_country(pops[[population]], stratum), definition) %>%
+      mutate(`1 October status` = if_else(definition == "HPV_vaccinated_phase2", "last visit on/before 1 Oct (SAP)",
+                                          "visit on/after 2 July (sensitivity)"),
+             population = population, stratum = stratum, .before = 1))
+save_tbl(t8c, "table8c_phase2_gee") %>% kbl(caption = "Table 8c. GEE (exchangeable, robust SE clustered by CHW zone)")
+```
+
+## Time to vaccination over the full follow-up, arm × period
+
+```{r phase2_tte}
+t8d <- pmap_dfr(grid, function(population, stratum) {
+  d <- sub_country(pops[[population]], stratum) %>% filter(prior_vacc %in% 0L, !is.na(age_s1))
+  tau <- if (stratum == "Overall") 176 else unique(d$tau_p2)[1]
+  s <- surv_by_arm(d, tau, "time_p2", "event_p2", weeks = c(12, 18, 25))
+  sp <- split_periods(d, as.list(d$tau_p1), "time_p2", "event_p2")
+  cp <- fit_cox_period(sp, c("Before 2 July", "After 2 July"))
+  tibble(population = population, stratum = stratum, n = nrow(d), tau = tau,
+         `dRMST, days` = fmt_ci(s$dRMST$dRMST, s$dRMST$lo, s$dRMST$hi),
+         `HR before 2 July` = with(cp$summary[1, ], fmt_ci(HR, HR_lo, HR_hi)),
+         `HR after 2 July` = with(cp$summary[2, ], fmt_ci(HR, HR_lo, HR_hi)),
+         `arm x period p` = fmt_p(cp$interaction_p))
+})
+save_tbl(t8d, "table8d_phase2_tte") %>% kbl(caption = "Table 8d. Full follow-up to 1 October: RMST and HR by period")
+km_plot(function(cn) survfit(Surv(time_p2, event_p2) ~ arm,
+                             data = pops[[1]] %>% filter(country == cn, prior_vacc %in% 0L)),
+        176, "Figure 4b. Time to HPV vaccination to 1 October 2026 (girls unvaccinated at launch, ITT)",
+        cross = 84.5)
+```
+
+## Historical comparison (descriptive)
+
+Coverage gained by the former control arm during phase 2 (2 July – 1 October)
+versus coverage gained by the intervention arm during phase 1 (launch – 1 July).
+
+```{r historical}
+hist_one <- function(d) {
+  c2 <- d %>% filter(arm01 == 0, HPV_vaccinated %in% 0L, !is.na(HPV_vaccinated_phase2))
+  i1 <- d %>% filter(arm01 == 1, prior_vacc %in% 0L, !is.na(HPV_vaccinated))
+  w_c <- wilson_ci(sum(c2$HPV_vaccinated_phase2), nrow(c2)); w_i <- wilson_ci(sum(i1$HPV_vaccinated), nrow(i1))
+  # KM conditional uptake: control S(tau2)/S(tau1); intervention 1 - S(tau1)
+  cs <- d %>% filter(arm01 == 0, prior_vacc %in% 0L); is <- d %>% filter(arm01 == 1, prior_vacc %in% 0L)
+  k_c <- summary(survfit(Surv(time_p2, event_p2) ~ 1, cs), times = c(84, 176), extend = TRUE)$surv
+  k_i <- summary(survfit(Surv(time_p1, event_p1) ~ 1, is), times = 84, extend = TRUE)$surv
+  tibble(`Control, phase 2 uptake (complete case)` = sprintf("%d/%d, %s", sum(c2$HPV_vaccinated_phase2), nrow(c2), fmt_pp(w_c[1], w_c[2], w_c[3])),
+         `Intervention, phase 1 uptake (complete case)` = sprintf("%d/%d, %s", sum(i1$HPV_vaccinated), nrow(i1), fmt_pp(w_i[1], w_i[2], w_i[3])),
+         `Control, phase 2 uptake (KM)` = sprintf("%.1f%%", 100 * (1 - k_c[2] / k_c[1])),
+         `Intervention, phase 1 uptake (KM)` = sprintf("%.1f%%", 100 * (1 - k_i)))
+}
+pmap_dfr(grid, function(population, stratum)
+  hist_one(sub_country(pops[[population]], stratum)) %>% mutate(population = population, stratum = stratum, .before = 1)) %>%
+  save_tbl("table8e_historical") %>% kbl(caption = "Table 8e. Historical comparison (cannot separate the intervention from time trends)")
+```
+
+# Save results
+
+```{r save}
+saveRDS(list(table3 = t3, table4 = t4, table7 = t7, mi = mi_out, manski = mk, table8a = t8a,
+             knots = knots, session = sessionInfo()), file.path(params$out_dir, "analysis_results.rds"))
+sessionInfo()
+```

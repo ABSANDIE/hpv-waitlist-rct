@@ -1,8 +1,19 @@
+# Real trial data and anything derived from it: never committed
 data/raw/
+config_real.R
 *.csv
 *.xlsx
 *.dta
+*.rds
+# Generated outputs (reproducible with run_all.R)
+outputs/*
+!outputs/.gitkeep
+*.html
+*_files/
+*_cache/
+# R and system files
 .Renviron
 .Rhistory
 .RData
+.Rproj.user/
 .DS_Store

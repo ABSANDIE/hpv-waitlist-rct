@@ -1,7 +1,8 @@
 # =============================================================================
 # hpv_functions.R
 # Shared helpers for the HPV community follow-up trial (Mali, Cote d'Ivoire).
-# Implements the derivations of SAP v2.1, "Derivation from CHT Fields".
+# Implements the derivations of the registered SAP v2.1, mapped to the CHT
+# fields as documented in SAP v2.5 ("Derivation from CHT Fields").
 # Sourced by 01_prepare_analysis_dataset.Rmd and 02_prespecified_analysis.Rmd.
 # =============================================================================
 
@@ -9,7 +10,7 @@ suppressPackageStartupMessages({
   library(dplyr); library(tidyr); library(readr); library(stringr); library(purrr)
 })
 
-# ---- Study constants (SAP v2.1) ---------------------------------------------
+# ---- Study constants (SAP) ---------------------------------------------
 study_dates <- list(
   launch        = c(Mali = as.Date("2026-04-08"), CIV = as.Date("2026-04-09")),
   phase1_end    = as.Date("2026-07-01"),   # primary endline: status on this date
@@ -174,17 +175,22 @@ clean_records <- function(rec, launch_by_country, first_vaccine_date = as.Date("
 #   undated_by  : earliest visit reporting a dose without a usable date
 #   last_unvacc : last date on/before `cutoff` the girl was documented as unvaccinated
 #   status_date : date of the visit that established `vacc` (assess_date_phase1 in the SAP)
-#   undated_after: a dose reported without a date at a visit after `cutoff`
-#                  (cannot be placed before/after cutoff -> cause 2 if status unknown)
+#   undated_after: a dose reported without a usable date that cannot be counted:
+#                  at a visit after `cutoff`, or at any visit when undated_counts = FALSE
+#                  (-> cause 2 if status unknown)
+# `undated_counts`: FALSE (registered SAP v2.1): a dose without a documented date
+#   gives unknown status. TRUE (sensitivity): a dose reported without a date at a
+#   visit on/before `cutoff` counts as vaccinated by that visit.
 # `known_from`: earliest assessment date that can establish "not vaccinated on cutoff".
-#   Phase 1 (SAP v2.1): assessments dated 2 July - 1 October 2026 -> known_from = 2 July.
-#   Phase 2 (SAP v2.1): status at the last visit on/before 1 October -> known_from = launch.
-status_at <- function(rec, cutoff, known_from, window_end = study_dates$window_end) {
+#   Phase 1 (SAP): assessments dated 2 July - 1 October 2026 -> known_from = 2 July.
+#   Phase 2 (SAP): status at the last visit on/before 1 October -> known_from = launch.
+status_at <- function(rec, cutoff, known_from, window_end = study_dates$window_end,
+                      undated_counts = FALSE) {
   rec %>%
     filter(assess_date <= window_end) %>%
     mutate(kf = if (length(known_from) == 1) known_from else known_from[country],
            yes_dated_by  = hpv %in% "yes" & !is.na(vacc_date) & vacc_date <= cutoff,
-           yes_undat_by  = hpv %in% "yes" & is.na(vacc_date) & assess_date <= cutoff,
+           yes_undat_by  = undated_counts & hpv %in% "yes" & is.na(vacc_date) & assess_date <= cutoff,
            est_no        = (hpv %in% "no" & assess_date >= kf) |
                            (hpv %in% "yes" & !is.na(vacc_date) & vacc_date > cutoff & assess_date >= kf)) %>%
     group_by(country, girl_id) %>%
@@ -195,7 +201,7 @@ status_at <- function(rec, cutoff, known_from, window_end = study_dates$window_e
       last_unvacc = suppressWarnings(max(assess_date[hpv %in% "no" & assess_date <= cutoff], na.rm = TRUE)),
       date_yes    = suppressWarnings(min(assess_date[yes_dated_by | yes_undat_by], na.rm = TRUE)),
       date_no     = suppressWarnings(min(assess_date[est_no], na.rm = TRUE)),
-      undated_after = any(hpv %in% "yes" & is.na(vacc_date) & assess_date > cutoff),
+      undated_after = any(hpv %in% "yes" & is.na(vacc_date) & (assess_date > cutoff | !undated_counts)),
       conflict    = any(yes_dated_by) & any(hpv %in% "no" & assess_date > cutoff),
       n_contacts  = n(),
       last_visit  = max(assess_date),
@@ -203,7 +209,7 @@ status_at <- function(rec, cutoff, known_from, window_end = study_dates$window_e
     mutate(across(c(first_dose, undated_by, last_unvacc, date_yes, date_no),
                   ~ if_else(is.finite(.x), .x, as.Date(NA))),
            vacc = case_when(!is.na(first_dose) & first_dose <= cutoff ~ 1L,
-                            !is.na(undated_by) & undated_by <= cutoff ~ 1L,
+                            undated_counts & !is.na(undated_by) & undated_by <= cutoff ~ 1L,
                             known_no ~ 0L,
                             TRUE ~ NA_integer_),
            status_date = case_when(vacc == 1L ~ date_yes, vacc == 0L ~ date_no))

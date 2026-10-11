@@ -59,6 +59,9 @@ Rscript run_all.R quick   # about 5 minutes: 5 imputations, 50 bootstrap replica
 Rscript run_all.R         # full specification: 50 imputations, 500 bootstrap replicates
 ```
 
+To run the SAP v2.5 derivation rules as a sensitivity analysis, render the first report with
+`params = list(undated_dose_rule = "visit_date", cause_scheme = "v2.5")`.
+
 `run_all.R` generates the synthetic data (fixed seed) if it is missing, then renders the two reports.
 Everything lands in `outputs/`:
 
@@ -92,12 +95,15 @@ had been run: the registry upload, not the tag, is the evidence of pre-specifica
 
 Version 2.5 (9 October 2026) was written after version 2.1 was registered. It adds a mapping of the
 analysis variables to the CHT fields and two rule changes. The code in this repository was first
-written against version 2.5, so it differs from the registered plan in two places:
+written against version 2.5, which differs from the registered plan in two places. Pull request #1
+("Align derivations with the registered SAP v2.1") made the registered rules the defaults. The
+version 2.5 rules remain available as sensitivity analyses through two parameters of
+`analysis/01_prepare_analysis_dataset.Rmd`:
 
-| Topic | Registered SAP v2.1 | Code as first committed (SAP v2.5) |
+| Topic | Registered SAP v2.1 (default) | SAP v2.5 rule (sensitivity) |
 |---|---|---|
-| Dose reported without a documented date | Unknown status, cause 2 | Vaccinated if reported at a visit on or before 1 July; unknown (cause 2) if reported later |
-| Parents refused to give information | No separate category; counted as cause 2 (reached, status not verified) | Separate cause 4, placed before 3a in the hierarchy |
+| Dose reported without a documented date: `undated_dose_rule` | `"unknown"`: unknown status, cause 2 | `"visit_date"`: vaccinated if reported at a visit on or before 1 July; unknown (cause 2) if reported later |
+| Parents refused to give information: `cause_scheme` | `"v2.1"`: counted as cause 2 (reached, status not verified) | `"v2.5"`: separate cause 4, placed before 3a in the hierarchy |
 
 Two further points follow from what the CHT tables contain, and apply in every version of the code:
 

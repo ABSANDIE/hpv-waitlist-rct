@@ -1,6 +1,6 @@
 # =============================================================================
 # hpv_analysis_functions.R
-# Model-fitting helpers for 02_prespecified_analysis.Rmd (SAP v2.1).
+# Model-fitting helpers for 02_prespecified_analysis.Rmd (registered SAP v2.1).
 # =============================================================================
 suppressPackageStartupMessages({
   library(dplyr); library(tidyr); library(purrr); library(lme4); library(survival)

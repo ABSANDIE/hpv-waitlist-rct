@@ -52,6 +52,8 @@ install.packages(c("dplyr", "tidyr", "readr", "stringr", "purrr", "lubridate", "
 
 The `survRM2` package is optional; if installed, it adds the Uno et al. RMST cross-check.
 
+Rendering the reports needs pandoc. RStudio includes it. To run from Terminal, install pandoc from https://pandoc.org/installing.html, or point R to the copy inside RStudio, for example: `export RSTUDIO_PANDOC=/Applications/RStudio.app/Contents/Resources/app/quarto/bin/tools/aarch64` (use `x86_64` instead of `aarch64` on an Intel Mac).
+
 Then, from the repository root:
 
 ```sh

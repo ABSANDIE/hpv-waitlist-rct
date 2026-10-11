@@ -1,6 +1,6 @@
 ---
 title: "HPV community follow-up trial: preparation of the analysis dataset"
-subtitle: "Implements SAP v2.5 (Derivation from CHT Fields; Key Variables; Analysis Populations)"
+subtitle: "Registered SAP v2.1 (7 October 2026); CHT field mapping as documented in SAP v2.5"
 date: "`r format(Sys.time(), '%d %B %Y %H:%M')`"
 output:
   html_document:
@@ -22,6 +22,10 @@ params:
   civ_verification: "civ_verification.csv"
   # Codes of s_can_we_have_vaccination_infos meaning "information not available"
   followup_no_info_values: "no,non,info_not_available"
+  # Registered SAP (v2.1, 7 Oct 2026) rules are the defaults. The alternatives
+  # are the rules of the later SAP v2.5 and are run only as sensitivity analyses.
+  undated_dose_rule: "unknown"   # "unknown" (SAP v2.1: cause 2) or "visit_date"
+  cause_scheme: "v2.1"           # "v2.1": refusal within cause 2; "v2.5": refusal = cause 4
   out_dir: "../outputs"
   functions: "../R/hpv_functions.R"
 ---
@@ -41,7 +45,7 @@ kbl <- function(x, ...) knitr::kable(x, format.args = list(big.mark = ","), ...)
 > **Blinding note.** This document reports data-quality and completeness
 > checks only. It never tabulates vaccination outcomes by arm. Outcome
 > comparisons are made only in `02_prespecified_analysis.Rmd`, after the
-> eligibility review has been frozen and the dataset locked (SAP v2.5).
+> eligibility review has been frozen and the dataset locked (SAP).
 
 # Load the CHT extracts
 
@@ -72,7 +76,7 @@ if (length(missing_tbl)) warning("No patients table for: ", paste(missing_tbl, c
 
 Arm comes from `vaccination_trial_branch`; date of birth from `date_of_birth`,
 completed by `etl_dob_combine`; site and CHW supervision zone from `site_uuid`
-and `supervisor_area_uuid` (SAP v2.5). Names and phone numbers are never read
+and `supervisor_area_uuid` (SAP v2.5 field mapping). Names and phone numbers are never read
 into the analysis dataset.
 
 ```{r patients}
@@ -176,7 +180,7 @@ girls %>% count(country, dob_source, zone_source) %>% kbl(caption = "Source of d
 
 The age-out allocation is not recorded in CHT. It is recovered from the current
 date of birth: intervention-arm girls who reached the national upper age limit
-after launch and on or before 1 July 2026 (SAP v2.5).
+after launch and on or before 1 July 2026 (SAP v2.5 field mapping).
 
 ```{r ageout}
 girls <- girls %>%
@@ -208,7 +212,7 @@ is investigated as a likely date-of-birth correction made after randomization.
 
 # Post-randomization eligibility review (cause 3b)
 
-Rule (SAP v2.5): not eligible if the current sex is male, or if the current date
+Rule (SAP v2.5 field mapping): not eligible if the current sex is male, or if the current date
 of birth places the girl outside the national eligibility range for the whole
 study period (already past the upper limit at launch, or not reaching the lower
 limit by 1 October 2026). The review list below contains **no arm and no
@@ -233,9 +237,11 @@ girls %>% count(country, review_reason) %>% kbl(caption = "Eligibility review (N
 # Vaccination status
 
 * **Phase 1 (status on 1 July 2026)**: vaccinated if any form records a dose
-  dated on or before 1 July (or a dose without a usable date reported at a visit
-  on or before 1 July); known unvaccinated if an assessment dated 2 July – 1
-  October records no dose or a dose dated after 1 July.
+  dated on or before 1 July; known unvaccinated if an assessment dated 2 July – 1
+  October records no dose or a dose dated after 1 July. A dose reported without
+  a documented date gives unknown status, cause 2 (registered SAP v2.1). With
+  `undated_dose_rule = "visit_date"`, a dose reported without a date at a visit
+  on or before 1 July counts as vaccinated by that visit (sensitivity).
 * **Verification-timing sensitivity**: the same, using only assessments up to 30
   August 2026.
 * **Phase 2 (status on 1 October 2026)**: vaccinated if a dose is dated on or
@@ -246,12 +252,15 @@ girls %>% count(country, review_reason) %>% kbl(caption = "Eligibility review (N
   dose dated on or after launch; otherwise unknown.
 
 ```{r status}
-p1  <- status_at(rec, study_dates$phase1_end, known_from = study_dates$crossover)
+undated_counts <- identical(params$undated_dose_rule, "visit_date")
+p1  <- status_at(rec, study_dates$phase1_end, known_from = study_dates$crossover,
+                 undated_counts = undated_counts)
 p1a <- status_at(rec, study_dates$phase1_end, known_from = study_dates$crossover,
-                 window_end = study_dates$verif_close_1)
-p2  <- status_at(rec, study_dates$window_end, known_from = launch)
+                 window_end = study_dates$verif_close_1, undated_counts = undated_counts)
+p2  <- status_at(rec, study_dates$window_end, known_from = launch, undated_counts = undated_counts)
 # Sensitivity: phase 2 status established only by a visit on/after 2 July
-p2r <- status_at(rec, study_dates$window_end, known_from = study_dates$crossover)
+p2r <- status_at(rec, study_dates$window_end, known_from = study_dates$crossover,
+                 undated_counts = undated_counts)
 # Verification visit for phase 1: first assessment with a recorded status in 2 July - 1 October
 win_visit <- rec %>% filter(!is.na(hpv), assess_date >= study_dates$crossover,
                             assess_date <= study_dates$window_end) %>%
@@ -294,7 +303,7 @@ girls <- girls %>%
 
 ## Conflicting records
 
-Records are resolved in favour of a documented dose date (SAP v2.5). Pooled
+Records are resolved in favour of a documented dose date (SAP v2.5 field mapping). Pooled
 counts, all arms together:
 
 ```{r conflicts}
@@ -307,8 +316,10 @@ girls %>% group_by(country) %>%
 
 # Cause of unknown status
 
-Hierarchy 3b → 1 → 4 → 3a → 2 → 3c (SAP v2.5). Assigned without reference to
-vaccination outcomes.
+Registered SAP v2.1: hierarchy 3b → 1 → 3a → 2 → 3c, with refusal by parents
+counted in cause 2 (the girl was reached but her status could not be verified).
+With `cause_scheme = "v2.5"`: hierarchy 3b → 1 → 4 → 3a → 2 → 3c, refusal as a
+separate cause 4. Assigned without reference to vaccination outcomes.
 
 ```{r causes}
 assign_cause <- function(g, vacc, window_start, window_end, visited_window) {
@@ -316,11 +327,12 @@ assign_cause <- function(g, vacc, window_start, window_end, visited_window) {
            (!is.na(g$death_date) & g$death_date <= window_end) |
            (!is.na(g$family_muted_date) & g$family_muted_date <= window_end) | g$any_moved
   aged  <- !is.na(g$ageout_date) & g$ageout_date <= window_end & !visited_window
-  noinf <- g$any_no_card | g$any_info_unavailable | g$undated_after
+  refused_c4 <- g$any_refused & identical(params$cause_scheme, "v2.5")
+  noinf <- g$any_no_card | g$any_info_unavailable | g$undated_after | g$any_refused
   case_when(!is.na(vacc)          ~ NA_character_,
             g$eligible_final == 0 ~ "3b",
             deact                 ~ "1",
-            g$any_refused         ~ "4",
+            refused_c4            ~ "4",
             aged                  ~ "3a",
             noinf                 ~ "2",
             TRUE                  ~ "3c")
@@ -358,8 +370,8 @@ usable date is placed at the visit that reported it (an upper bound).
 girls <- girls %>%
   mutate(tau_p1 = as.numeric(study_dates$phase1_end - launch),
          tau_p2 = as.numeric(study_dates$window_end - launch),
-         event_date_p1 = pmin(first_dose_p1, undated_by_p1, na.rm = TRUE),
-         event_date_p2 = pmin(first_dose_p2, undated_by_p2, na.rm = TRUE),
+         event_date_p1 = if (undated_counts) pmin(first_dose_p1, undated_by_p1, na.rm = TRUE) else first_dose_p1,
+         event_date_p2 = if (undated_counts) pmin(first_dose_p2, undated_by_p2, na.rm = TRUE) else first_dose_p2,
          # Phase 1 (12 weeks): known unvaccinated -> censored at 1 July; unknown -> at last_status_date
          last_status_date = last_unvacc_p1,
          time_p1  = case_when(vacc_p1 == 1 ~ as.numeric(event_date_p1 - launch),

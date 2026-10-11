@@ -1,6 +1,6 @@
 ---
 title: "HPV community follow-up trial: pre-specified analysis"
-subtitle: "Statistical Analysis Plan v2.1 (7 October 2026)"
+subtitle: "Registered Statistical Analysis Plan v2.1 (7 October 2026)"
 date: "`r format(Sys.time(), '%d %B %Y %H:%M')`"
 output:
   html_document:
@@ -73,7 +73,7 @@ flow <- an %>% group_by(country, arm) %>%
             `unknown: 2 no information source` = sum(pop_itt & unknown_reason %in% "2"),
             `unknown: 3a aged out` = sum(pop_itt & unknown_reason %in% "3a"),
             `unknown: 3c not reached in time` = sum(pop_itt & unknown_reason %in% "3c"),
-            `unknown: 4 parents refused` = sum(pop_itt & unknown_reason %in% "4"),
+            `unknown: 4 parents refused (v2.5 scheme only)` = sum(pop_itt & unknown_reason %in% "4"),
             `phase 2 status known` = sum(pop_itt & status_known_phase2 == 1), .groups = "drop")
 flow %>% pivot_longer(-c(country, arm)) %>% pivot_wider(names_from = c(country, arm), values_from = value) %>%
   save_tbl("fig3_consort_counts") %>% kbl(caption = "CONSORT flow counts")
@@ -601,7 +601,10 @@ sg_cov %>% filter(!plotted) %>% select(analysis, n, n_int, n_ctl, events_int, ev
 p5a
 ```
 
-## (b) Uptake at 12 weeks among girls unvaccinated at launch
+## (b) Uptake at 12 weeks among girls unvaccinated at launch (post hoc)
+
+Not in the registered SAP, which specifies subgroup ORs for the primary outcome
+only (Figure 5). Added after the primary results were seen; exploratory.
 
 ```{r forest_upt}
 cf_upt <- t3 %>% filter(outcome == names(outcomes_p1)[2], population == "All girls (ITT)", stratum == "Overall")

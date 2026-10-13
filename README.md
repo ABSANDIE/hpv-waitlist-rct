@@ -111,10 +111,17 @@ Two further points follow from what the CHT tables contain, and apply in every v
 
 - **Eligibility review (cause 3b).** Version 2.1 bases it on the CHT audit trail of age and sex
   corrections. CHT keeps only current values, so the code applies the review rule to the current
-  date of birth and sex (as described in version 2.5).
+  date of birth and sex: a girl is excluded if she is male, if she had already reached the upper
+  age limit at randomization (24 March 2026), or if she does not reach the lower limit by
+  1 October 2026.
 - **Age-out allocation.** The allocation list does not record which girls were allocated by the
-  age-out rule. The code recovers them from the date of birth and checks the counts against the
-  known totals (1,945 in Mali, 165 in Côte d'Ivoire).
+  age-out rule. The code recovers them from the date of birth as intervention-arm girls reaching
+  the upper age limit between 1 April and 1 July 2026, the window used at allocation, and checks
+  the counts against the known totals (1,945 in Mali, 165 in Côte d'Ivoire). The first version of
+  the code used launch (8–9 April) instead of 24 March and 1 April as reference dates. Girls who
+  reached the limit between randomization and launch were then wrongly excluded at the
+  eligibility review, most of them age-out girls in the intervention arm. Pull request #2
+  corrected this.
 
 Any change to the analysis after the first code commit is visible in the history of this
 repository.

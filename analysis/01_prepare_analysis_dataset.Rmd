@@ -26,6 +26,12 @@ params:
   # are the rules of the later SAP v2.5 and are run only as sensitivity analyses.
   undated_dose_rule: "unknown"   # "unknown" (SAP v2.1: cause 2) or "visit_date"
   cause_scheme: "v2.1"           # "v2.1": refusal within cause 2; "v2.5": refusal = cause 4
+  # Allocation (both countries): randomization on 24 March 2026; girls expected to
+  # reach the upper age limit between 1 April and 1 July 2026 were allocated to the
+  # intervention arm by the age-out rule (information from the PI, 12 Oct 2026).
+  randomization_date: "2026-03-24"
+  ageout_window_start: "2026-04-01"
+  ageout_window_end: "2026-07-01"
   out_dir: "../outputs"
   functions: "../R/hpv_functions.R"
 ---
@@ -180,7 +186,9 @@ girls %>% count(country, dob_source, zone_source) %>% kbl(caption = "Source of d
 
 The age-out allocation is not recorded in CHT. It is recovered from the current
 date of birth: intervention-arm girls who reached the national upper age limit
-after launch and on or before 1 July 2026 (SAP v2.5 field mapping).
+within the allocation window, 1 April to 1 July 2026 (the window used at
+allocation on 24 March 2026; parameters `ageout_window_start` and
+`ageout_window_end`).
 
 ```{r ageout}
 girls <- girls %>%
@@ -192,7 +200,8 @@ girls <- girls %>%
          age_launch_days = as.numeric(launch - dob),
          age_years       = floor(time_length(interval(dob, launch), "years")),
          months_remaining = as.numeric(ageout_date - launch) / 30.4375,
-         ageout_rule     = !is.na(ageout_date) & ageout_date > launch & ageout_date <= study_dates$phase1_end,
+         ageout_rule     = !is.na(ageout_date) & ageout_date >= as.Date(params$ageout_window_start) &
+                           ageout_date <= as.Date(params$ageout_window_end),
          ageout          = ageout_rule & arm == "Intervention",
          ageout_rule_control = ageout_rule & arm == "Control",
          allocation      = if_else(ageout, "Age-out rule", "Randomized"))
@@ -205,6 +214,19 @@ girls %>% group_by(country) %>%
   mutate(`age-out expected` = expected_ageout[country],
          `difference` = `age-out recovered (intervention)` - `age-out expected`) %>%
   kbl(caption = "Recovered age-out allocation vs known totals (Mali 1,945; CIV 165)")
+
+# Date each girl reaches the upper age limit, by arm (no outcomes)
+rand_date <- as.Date(params$randomization_date)
+girls %>% mutate(ageout_period = case_when(
+    is.na(ageout_date) ~ "DOB missing",
+    ageout_date < rand_date ~ "1. before randomization (ineligible)",
+    ageout_date < as.Date(params$ageout_window_start) ~ "2. randomization to window start",
+    ageout_date < launch ~ "3. window start to launch",
+    ageout_date <= as.Date(params$ageout_window_end) ~ "4. launch to window end",
+    TRUE ~ "5. after window end")) %>%
+  count(country, arm, ageout_period) %>%
+  pivot_wider(names_from = arm, values_from = n, values_fill = 0) %>%
+  kbl(caption = "When girls reach the upper age limit (periods 3 and 4 form the age-out allocation window)")
 ```
 
 Any difference from the known totals, and any control-arm girl meeting the rule,
@@ -212,17 +234,20 @@ is investigated as a likely date-of-birth correction made after randomization.
 
 # Post-randomization eligibility review (cause 3b)
 
-Rule (SAP v2.5 field mapping): not eligible if the current sex is male, or if the current date
-of birth places the girl outside the national eligibility range for the whole
-study period (already past the upper limit at launch, or not reaching the lower
-limit by 1 October 2026). The review list below contains **no arm and no
+Rule: not eligible if the current sex is male, or if the current date of birth
+places the girl outside the national eligibility range for the whole study
+period: already past the upper limit **at randomization (24 March 2026)**, or
+not reaching the lower limit by 1 October 2026. A girl who reached the upper
+limit between randomization and launch was eligible when allocated and stays in
+the analysis. The review list below contains **no arm and no
 outcome**, so it can be checked by a blinded data manager and frozen before the
 analysis.
 
 ```{r eligibility}
 girls <- girls %>%
   mutate(inelig_sex = sex %in% "male",
-         inelig_age = !is.na(dob) & (ageout_date <= launch | eligible_from > study_dates$window_end),
+         inelig_age = !is.na(dob) & (ageout_date <= as.Date(params$randomization_date) |
+                                     eligible_from > study_dates$window_end),
          eligible_final = as.integer(!(inelig_sex | inelig_age)),
          review_reason = case_when(inelig_sex & inelig_age ~ "sex and age",
                                    inelig_sex ~ "sex", inelig_age ~ "age"),

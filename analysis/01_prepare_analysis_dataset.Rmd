@@ -29,6 +29,11 @@ params:
   # Allocation (both countries): randomization on 24 March 2026; girls expected to
   # reach the upper age limit between 1 April and 1 July 2026 were allocated to the
   # intervention arm by the age-out rule (information from the PI, 12 Oct 2026).
+  # Allocation lists of the girls allocated by the age-out rule (columns
+  # c50_patient_uuid, ao_group), one file per country, in data_dir. If a file is
+  # absent, the age-out allocation is recovered from date of birth instead.
+  mali_ageout: "mali_ageout.csv"
+  civ_ageout: "civ_ageout.csv"
   randomization_date: "2026-03-24"
   ageout_window_start: "2026-04-01"
   ageout_window_end: "2026-07-01"
@@ -184,11 +189,14 @@ girls %>% count(country, dob_source, zone_source) %>% kbl(caption = "Source of d
 
 # Allocation by the age-out rule and age covariates
 
-The age-out allocation is not recorded in CHT. It is recovered from the current
-date of birth: intervention-arm girls who reached the national upper age limit
-within the allocation window, 1 April to 1 July 2026 (the window used at
-allocation on 24 March 2026; parameters `ageout_window_start` and
-`ageout_window_end`).
+The age-out allocation is not recorded in CHT. It is taken from the **allocation
+lists** made at randomization (24 March 2026): one file per country with the
+girls allocated to the intervention arm by the age-out rule (`mali_ageout`,
+`civ_ageout`). If a country's list is absent, the allocation is recovered from
+the current date of birth instead: intervention-arm girls reaching the national
+upper age limit between 1 April and 1 July 2026 (`ageout_window_start`,
+`ageout_window_end`). The date-of-birth rule is also shown next to the list, as
+a check of how well current dates of birth agree with those used at allocation.
 
 ```{r ageout}
 girls <- girls %>%
@@ -201,19 +209,51 @@ girls <- girls %>%
          age_years       = floor(time_length(interval(dob, launch), "years")),
          months_remaining = as.numeric(ageout_date - launch) / 30.4375,
          ageout_rule     = !is.na(ageout_date) & ageout_date >= as.Date(params$ageout_window_start) &
-                           ageout_date <= as.Date(params$ageout_window_end),
-         ageout          = ageout_rule & arm == "Intervention",
+                           ageout_date <= as.Date(params$ageout_window_end))
+
+# Allocation lists (source of truth when available)
+ao_files <- c(Mali = params$mali_ageout, CIV = params$civ_ageout)
+ao_list <- map_dfr(countries, function(cn) {
+  f <- ao_files[[cn]]
+  d <- if (is.null(f) || is.na(f) || !nzchar(f)) NULL else read_table(path(f))
+  if (is.null(d)) return(tibble())
+  tibble(country = cn, girl_id = as.character(d$c50_patient_uuid),
+         ao_group = as.character(col_or_na(d, "ao_group")))
+}) %>% distinct(country, girl_id, .keep_all = TRUE)
+list_countries <- unique(ao_list$country)
+girls <- girls %>%
+  left_join(ao_list %>% mutate(in_ageout_list = TRUE), by = c("country", "girl_id")) %>%
+  mutate(in_ageout_list = coalesce(in_ageout_list, FALSE),
+         ageout_source = if_else(country %in% list_countries, "allocation list", "date of birth"),
+         ageout = if_else(country %in% list_countries, in_ageout_list & arm == "Intervention",
+                          ageout_rule & arm == "Intervention"),
+         ageout_list_control = in_ageout_list & arm == "Control",
          ageout_rule_control = ageout_rule & arm == "Control",
-         allocation      = if_else(ageout, "Age-out rule", "Randomized"))
+         allocation = if_else(ageout, "Age-out rule", "Randomized"))
 
 girls %>% group_by(country) %>%
-  summarise(intervention = sum(arm == "Intervention"), control = sum(arm == "Control"),
-            `age-out recovered (intervention)` = sum(ageout),
-            `meets age-out rule in control arm` = sum(ageout_rule_control),
+  summarise(source = first(ageout_source),
+            intervention = sum(arm == "Intervention"), control = sum(arm == "Control"),
+            `age-out (analysis)` = sum(ageout),
+            `listed girls in control arm` = sum(ageout_list_control),
             `missing DOB` = sum(is.na(dob)), .groups = "drop") %>%
   mutate(`age-out expected` = expected_ageout[country],
-         `difference` = `age-out recovered (intervention)` - `age-out expected`) %>%
-  kbl(caption = "Recovered age-out allocation vs known totals (Mali 1,945; CIV 165)")
+         `difference` = `age-out (analysis)` - `age-out expected`) %>%
+  kbl(caption = "Age-out allocation vs known totals (Mali 1,945; CIV 165)")
+```
+
+```{r ageout_list_checks, eval = nrow(ao_list) > 0}
+# Listed girls not found among trial girls in the master table
+ao_list %>% anti_join(girls, by = c("country", "girl_id")) %>% count(country, name = "listed girls not in master table") %>%
+  kbl(caption = "Allocation list: girls missing from the patients table")
+ao_list %>% count(country, ao_group) %>% kbl(caption = "Allocation list: ao_group values")
+# Agreement between the list and the date-of-birth rule (intervention arm)
+girls %>% filter(arm == "Intervention", country %in% list_countries) %>%
+  count(country, `in allocation list` = in_ageout_list, `meets DOB rule` = ageout_rule) %>%
+  kbl(caption = "Allocation list vs date-of-birth rule, intervention arm")
+```
+
+```{r ageout_periods}
 
 # Date each girl reaches the upper age limit, by arm (no outcomes)
 rand_date <- as.Date(params$randomization_date)
@@ -239,15 +279,17 @@ places the girl outside the national eligibility range for the whole study
 period: already past the upper limit **at randomization (24 March 2026)**, or
 not reaching the lower limit by 1 October 2026. A girl who reached the upper
 limit between randomization and launch was eligible when allocated and stays in
-the analysis. The review list below contains **no arm and no
+the analysis. As specified in the SAP, the age criterion is reviewed for
+randomized girls only: girls on the age-out allocation list were allocated
+because they were about to age out, so they are not excluded on age. The review list below contains **no arm and no
 outcome**, so it can be checked by a blinded data manager and frozen before the
 analysis.
 
 ```{r eligibility}
 girls <- girls %>%
   mutate(inelig_sex = sex %in% "male",
-         inelig_age = !is.na(dob) & (ageout_date <= as.Date(params$randomization_date) |
-                                     eligible_from > study_dates$window_end),
+         inelig_age = !ageout & !is.na(dob) & (ageout_date <= as.Date(params$randomization_date) |
+                                               eligible_from > study_dates$window_end),
          eligible_final = as.integer(!(inelig_sex | inelig_age)),
          review_reason = case_when(inelig_sex & inelig_age ~ "sex and age",
                                    inelig_sex ~ "sex", inelig_age ~ "age"),
@@ -434,7 +476,7 @@ analysis <- girls %>%
   transmute(
     country = factor(country, levels = c("Mali", "CIV")), girl_id,
     arm = factor(arm, levels = c("Control", "Intervention")), arm01 = as.integer(arm == "Intervention"),
-    allocation, ageout, ageout_rule_control, site, chw_zone, zone_source,
+    allocation, ageout, ageout_source, in_ageout_list, ao_group, ageout_list_control, ageout_rule, ageout_rule_control, site, chw_zone, zone_source,
     sex, dob, dob_source, dob_approx, age_years, months_remaining, ageout_date,
     eligible_final, review_reason, pop_itt = eligible_final == 1,
     pop_randomized = eligible_final == 1 & !ageout,

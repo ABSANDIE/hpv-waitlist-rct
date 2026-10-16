@@ -7,7 +7,9 @@ params_prep <- list(
   mali_verification = "hpv_verification_mali.csv",
   civ_patients      = "patients_rci.csv",
   civ_baseline      = "children_vaccination_rci.csv",
-  civ_followup      = "children_vaccination_followup_r.csv",
+  civ_followup      = "children_vaccination_followup_rci.csv",
   civ_verification  = "hpv_verification_rci.csv",
+  mali_ageout       = "age_out_mli.xlsx",
+  civ_ageout        = "age_out_civ.xlsx",
   out_dir           = "../outputs/real")
 params_analysis <- list(data = "../outputs/real/analysis_dataset.rds", out_dir = "../outputs/real")

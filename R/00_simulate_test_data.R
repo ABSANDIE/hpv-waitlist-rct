@@ -132,7 +132,8 @@ sim_country <- function(country, launch, lower, upper, n_rand_i, n_rand_c, n_age
            info_refused_by_parents = ifelse(refused, "true", "false"),
            info_unavailable_other = ifelse(other, "true", "false"))
   })
-  list(patients = patients, baseline = bl, followup = fu, verification = ver)
+  ageout <- tibble(c50_patient_uuid = id[ageout_alloc], ao_group = "age_out")
+  list(patients = patients, baseline = bl, followup = fu, verification = ver, ageout = ageout)
 }
 
 r <- function(x) max(20, round(x * scale))

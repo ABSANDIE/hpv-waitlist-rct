@@ -74,6 +74,33 @@ Everything lands in `outputs/`:
 | `table*.csv`, `sens_*.csv`, `fig*.csv` | The same tables as CSV |
 | `fig5a_*.png`, `fig5b_*.png` | Subgroup forest plots (coverage and uptake at 12 weeks) |
 
+## Results explorer (Shiny app)
+
+`app/` contains an interactive explorer of the pre-specified analyses. It reads the
+girl-level dataset made by the first report (`analysis_dataset.rds`) and the tables
+written by the second, and lets you choose the population (all girls or randomized
+girls), the country and the outcome. Models are refitted with the same functions as
+`02_prespecified_analysis.Rmd` and give the same numbers; the report remains the
+reference.
+
+Tabs: participant flow, baseline characteristics, coverage and uptake (crude and
+adjusted OR, risk difference and risk ratio), time to vaccination (Kaplan-Meier, RMST,
+Cox), subgroups, coverage by CHW zone, sensitivity analyses, and every table of the
+report.
+
+Run `run_all.R` first, then from the repository root:
+
+```r
+install.packages(c("shiny", "bslib", "DT"))   # once
+shiny::runApp("app")
+```
+
+The app lists every outputs folder that contains `analysis_dataset.rds`: `outputs/`
+(synthetic data) and, on a computer that has run `run_all.R real`, `outputs/real/`.
+**With real data the app shows results derived from girl-level records: run it on your
+own computer only, and do not deploy it to a public server** (such as shinyapps.io).
+The real data and outputs stay git-ignored.
+
 ## Repository layout
 
 ```
@@ -82,6 +109,7 @@ R/hpv_analysis_functions.R   models: glmer, marginal standardization, KM, RMST, 
 R/00_simulate_test_data.R    synthetic data generator
 analysis/01_prepare_analysis_dataset.Rmd
 analysis/02_prespecified_analysis.Rmd
+app/                         Shiny results explorer (local use)
 sap/                         statistical analysis plan
 run_all.R                    one command to reproduce everything
 config_real_template.R       template for running on the real extracts (the copy is git-ignored)

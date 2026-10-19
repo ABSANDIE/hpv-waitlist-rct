@@ -65,7 +65,8 @@ To run the SAP v2.5 derivation rules as a sensitivity analysis, render the first
 `params = list(undated_dose_rule = "visit_date", cause_scheme = "v2.5")`.
 
 `run_all.R` generates the synthetic data (fixed seed) if it is missing, then renders the two reports.
-Everything lands in `outputs/`:
+Everything lands in `outputs/` (with `Rscript run_all.R real`, in `outputs/real/` instead, so that
+real-data reports are never mixed up with the synthetic ones):
 
 | File | Content |
 |---|---|
@@ -101,6 +102,31 @@ The app lists every outputs folder that contains `analysis_dataset.rds`: `output
 own computer only, and do not deploy it to a public server** (such as shinyapps.io).
 The real data and outputs stay git-ignored.
 
+## Public demo app (synthetic data only)
+
+`app_public/` is a version of the explorer that can be published online as a demonstration of
+the analysis. **It runs on the synthetic data only; real trial results are not published through
+it.** It reads a single file, `app_public/data/summaries.rds`, made from the synthetic outputs and
+containing aggregated results only. The export script refuses to run if `outputs/` does not hold
+the synthetic dataset, and the app refuses to start on any other summaries.
+
+1. Make the summaries (a few minutes; from the repository root, after `Rscript run_all.R quick`):
+
+   ```sh
+   Rscript app_public/export_public_summaries.R
+   ```
+
+2. Check it locally: `shiny::runApp("app_public")`.
+3. Publish it to shinyapps.io (once: `install.packages("rsconnect")`, then paste the
+   `rsconnect::setAccountInfo(...)` line from shinyapps.io, Account > Tokens):
+
+   ```r
+   rsconnect::deployApp("app_public", appName = "hpv-trial-analysis-demo",
+                        appFiles = c("app.R", "public_helpers.R", "data/summaries.rds"))
+   ```
+
+`summaries.rds` is git-ignored like every `.rds` file.
+
 ## Repository layout
 
 ```
@@ -110,6 +136,7 @@ R/00_simulate_test_data.R    synthetic data generator
 analysis/01_prepare_analysis_dataset.Rmd
 analysis/02_prespecified_analysis.Rmd
 app/                         Shiny results explorer (local use)
+app_public/                  public demo of the explorer, synthetic data only
 sap/                         statistical analysis plan
 run_all.R                    one command to reproduce everything
 config_real_template.R       template for running on the real extracts (the copy is git-ignored)

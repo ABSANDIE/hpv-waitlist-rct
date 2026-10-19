@@ -19,9 +19,12 @@ if (mode == "real") {
   }
   if (mode == "quick") params_analysis <- list(mi_m = 5, boot_B = 50)
 }
-dir.create("outputs", showWarnings = FALSE)
-rmarkdown::render("analysis/01_prepare_analysis_dataset.Rmd", params = params_prep, output_dir = "outputs",
+# Real-data reports go to outputs/real/, next to the real-data tables, so they never
+# overwrite (or get mistaken for) the synthetic reports in outputs/
+out <- if (mode == "real") "outputs/real" else "outputs"
+dir.create(out, showWarnings = FALSE, recursive = TRUE)
+rmarkdown::render("analysis/01_prepare_analysis_dataset.Rmd", params = params_prep, output_dir = out,
                   envir = new.env(), quiet = TRUE)
-rmarkdown::render("analysis/02_prespecified_analysis.Rmd",   params = params_analysis, output_dir = "outputs",
+rmarkdown::render("analysis/02_prespecified_analysis.Rmd",   params = params_analysis, output_dir = out,
                   envir = new.env(), quiet = TRUE)
-message("Done. Reports and tables are in outputs/")
+message("Done. Reports and tables are in ", out, "/")

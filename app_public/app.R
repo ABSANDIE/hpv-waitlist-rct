@@ -71,7 +71,7 @@ ui <- page_navbar(
 
   nav_panel("Coverage and uptake",
     selectInput("outcome", "Outcome", choices = outcome_choices, width = "520px"),
-    layout_columns(col_widths = c(5, 7), fill = FALSE,
+    layout_columns(col_widths = breakpoints(sm = c(12, 12), lg = c(5, 7)), fill = FALSE,
       card(card_header("Crude coverage by arm (Wilson 95% CI)"), plotOutput("crude_plot", height = 330)),
       card(card_header("Adjusted analysis (pre-specified model)"), uiOutput("adj_box"),
            note("ARD and RR by marginal standardization."))),
@@ -135,12 +135,16 @@ server <- function(input, output, session) {
                    cr %>% transmute(stratum, arm = "Control", cov = cov_ctl, lo = cov_ctl_lo, hi = cov_ctl_hi)) %>%
       mutate(stratum = factor(country_label[stratum], levels = country_label),
              arm = factor(arm, levels = c("Control", "Intervention")))
-    ggplot(d, aes(stratum, cov, fill = arm)) +
-      geom_col(position = position_dodge(.75), width = .7) +
-      geom_errorbar(aes(ymin = lo, ymax = hi), position = position_dodge(.75), width = .15, colour = "grey20") +
-      geom_text(aes(label = pct1(cov), y = pmax(cov, .08)), position = position_dodge(.75), vjust = 1.6, size = 3.6, colour = "white") +
-      scale_fill_manual(values = pal) + scale_y_continuous(labels = scales::percent, expand = expansion(c(0, .12))) +
-      labs(x = NULL, y = "Vaccinated (girls with known status)", fill = NULL)
+    pd <- position_dodge(.8)
+    ggplot(d, aes(cov, stratum, fill = arm)) +
+      geom_col(position = pd, width = .75) +
+      geom_errorbar(aes(xmin = lo, xmax = hi), orientation = "y", position = pd, width = .2, colour = "grey20") +
+      geom_text(aes(x = hi, label = pct1(cov), group = arm), position = pd, hjust = -0.2, size = 3.4, colour = "grey20") +
+      scale_fill_manual(values = pal, breaks = c("Intervention", "Control")) +
+      scale_x_continuous(labels = scales::percent, limits = c(0, 1.18), breaks = seq(0, 1, .25)) +
+      scale_y_discrete(limits = rev) +
+      labs(y = NULL, x = "Vaccinated (known status)", fill = NULL) +
+      theme(panel.grid.major.y = element_blank())
   })
   output$crude_tbl <- renderDT({
     cr <- crude(); validate(need(nrow(cr) > 0, "Not estimable."))

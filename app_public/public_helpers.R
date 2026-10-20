@@ -78,5 +78,8 @@ stat_tile <- function(title, est, lo, hi, sub = NULL, primary = FALSE) {
       div(class = "small", title),
       div(style = "font-size: 1.9rem; font-weight: 600; line-height: 1.2;", sprintf("%.2f", est)),
       div(class = "small", sprintf("95%% CI %.2f to %.2f", lo, hi)),
-      if (!is.null(sub)) div(class = "small opacity-75", sub))
+      if (!is.null(sub)) div(class = "small opacity-75", sub),
+      div(class = "small opacity-75 fst-italic", "synthetic data"))
 }
+
+
